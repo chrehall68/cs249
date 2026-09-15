@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    os::linux::raw::stat,
     sync::{Arc, Mutex},
 };
 
@@ -12,7 +11,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use clap::Parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -31,9 +30,24 @@ struct ServerCli {
     host: String,
 }
 
+#[derive(Serialize)]
+struct Message {
+    username: String,
+    text: String,
+    message_id: usize,
+}
+impl Message {
+    pub fn new(username: String, text: String, message_id: usize) -> Self {
+        Self {
+            username,
+            text,
+            message_id,
+        }
+    }
+}
 struct Channel {
     users: HashSet<String>,
-    // messages: Vec<String>,
+    messages: Vec<Message>,
 }
 struct AppState {
     users: HashSet<String>,
@@ -104,6 +118,7 @@ async fn join_chanel(
         .entry(channel_name.clone())
         .or_insert(Channel {
             users: HashSet::new(),
+            messages: Vec::new(),
         });
     let username = headers
         .get("username")
@@ -183,6 +198,105 @@ async fn leave_channel(
         Json(json!({"channel": channel_name, "username": username, "left": true})),
     )
 }
+#[derive(Deserialize)]
+struct SendMessageBody {
+    text: String,
+}
+async fn send_message(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path(channel_name): Path<String>,
+    Json(body): Json<SendMessageBody>,
+) -> impl IntoResponse {
+    let mut state = state.lock().unwrap();
+    // verify that channel exists
+    if !channel_name.starts_with('#') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "code": 400, "message":"Channel must start with #"})),
+        );
+    }
+    if !state.channels.contains_key(&channel_name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "code": 400, "message":"Channel does not exist"})),
+        );
+    }
+
+    // then get the user and verify they exist
+    let username = headers
+        .get("username")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    if !state.users.contains(&username) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "code": 400, "message":"User does not exist"})),
+        );
+    }
+    // and verify that the user is part of the channel
+    let channel = state.channels.get_mut(&channel_name).unwrap();
+    if !channel.users.contains(&username) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "code": 400, "message":"User not in channel"})),
+        );
+    }
+    // user exists and is part of the channel -> send message
+    let message_id = channel.messages.len();
+    let message = Message::new(username.clone(), body.text.clone(), message_id);
+    channel.messages.push(message);
+    (
+        StatusCode::OK,
+        Json(
+            json!({"channel": channel_name, "message_id": message_id, "username": username, "text": body.text}),
+        ),
+    )
+}
+async fn get_messages(
+    State(state): State<SharedState>,
+    Path(channel_name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let state = state.lock().unwrap();
+    if !channel_name.starts_with('#') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "code": 400, "message":"Channel must start with #"})),
+        );
+    }
+    // we have a valid channel, now look it up
+    if !state.channels.contains_key(&channel_name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "code": 400, "message":"Channel does not exist"})),
+        );
+    }
+    let channel = state.channels.get(&channel_name).unwrap();
+    let limit = params
+        .get("limit")
+        .unwrap_or(&"20".to_owned())
+        .parse::<usize>()
+        .unwrap();
+    let offset = params
+        .get("offset")
+        .unwrap_or(&"0".to_owned())
+        .parse::<usize>()
+        .unwrap();
+    let messages = channel
+        .messages
+        .iter()
+        .rev()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    (
+        StatusCode::OK,
+        Json(json!({"channel": channel_name, "messages": messages})),
+    )
+}
 
 #[tokio::main]
 async fn main() {
@@ -203,6 +317,10 @@ async fn main() {
             delete(leave_channel),
         )
         .route("/channels/{channel}/users", get(list_channel_users))
+        .route(
+            "/channels/{channel}/messages",
+            post(send_message).get(get_messages),
+        )
         .with_state(state);
 
     // run our app
