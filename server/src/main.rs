@@ -5,9 +5,9 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    extract::{FromRequestParts, Path, Query, State},
+    http::{StatusCode, request::Parts},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use clap::Parser;
@@ -99,9 +99,46 @@ async fn get_channels(State(state): State<SharedState>) -> Json<Value> {
     let state = state.lock().unwrap();
     Json(json!({"channels": state.channels.iter().map(|(k, _)| k).collect::<Vec<_>>()}))
 }
+struct ExistingUser {
+    username: String,
+}
+impl FromRequestParts<SharedState> for ExistingUser {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &SharedState,
+    ) -> Result<Self, Self::Rejection> {
+        let Some(username_value) = parts.headers.get("username") else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"status": "error", "code": 400, "message":"Missing username header"})),
+            )
+                .into_response());
+        };
+        let Ok(username) = username_value.to_str() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"status": "error", "code": 400, "message":"Invalid username header"})),
+            )
+                .into_response());
+        };
+        let state = state.lock().unwrap();
+        if !state.users.contains(username) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"status": "error", "code": 400, "message":"User does not exist"})),
+            )
+                .into_response());
+        }
+        Ok(ExistingUser {
+            username: username.to_owned(),
+        })
+    }
+}
 async fn join_chanel(
     State(state): State<SharedState>,
-    headers: HeaderMap,
+    existing_user: ExistingUser,
     Path(channel_name): Path<String>,
 ) -> impl IntoResponse {
     let mut state = state.lock().unwrap();
@@ -111,7 +148,6 @@ async fn join_chanel(
             Json(json!({"status": "error", "code": 400, "message":"Channel must start with #"})),
         );
     }
-    // TODO - might want to validate that user exists too
     // we have a valid channel, now look it up
     let channel = state
         .channels
@@ -120,25 +156,21 @@ async fn join_chanel(
             users: HashSet::new(),
             messages: Vec::new(),
         });
-    let username = headers
-        .get("username")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    if channel.users.contains(&username) {
+    if channel.users.contains(&existing_user.username) {
         // duplicate
         (
             StatusCode::BAD_REQUEST,
             Json(json!({"status": "error", "code": 400, "message":"User already in channel"})),
         )
     }
-    // otherwise, add the user
+    // otherwise, add the user to the channel
     else {
-        channel.users.insert(username.clone());
+        channel.users.insert(existing_user.username.clone());
         (
             StatusCode::OK,
-            Json(json!({"channel": channel_name, "username": username, "joined": true})),
+            Json(
+                json!({"channel": channel_name, "username": existing_user.username, "joined": true}),
+            ),
         )
     }
 }
@@ -185,6 +217,12 @@ async fn leave_channel(
             Json(json!({"status": "error", "code": 400, "message":"Channel does not exist"})),
         );
     }
+    if !state.users.contains(&username) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "code": 400, "message":"User does not exist"})),
+        );
+    }
     let channel = state.channels.get_mut(&channel_name).unwrap();
     if !channel.users.contains(&username) {
         return (
@@ -204,7 +242,7 @@ struct SendMessageBody {
 }
 async fn send_message(
     State(state): State<SharedState>,
-    headers: HeaderMap,
+    existing_user: ExistingUser,
     Path(channel_name): Path<String>,
     Json(body): Json<SendMessageBody>,
 ) -> impl IntoResponse {
@@ -223,22 +261,9 @@ async fn send_message(
         );
     }
 
-    // then get the user and verify they exist
-    let username = headers
-        .get("username")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    if !state.users.contains(&username) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"User does not exist"})),
-        );
-    }
     // and verify that the user is part of the channel
     let channel = state.channels.get_mut(&channel_name).unwrap();
-    if !channel.users.contains(&username) {
+    if !channel.users.contains(&existing_user.username) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"status": "error", "code": 400, "message":"User not in channel"})),
@@ -246,12 +271,16 @@ async fn send_message(
     }
     // user exists and is part of the channel -> send message
     let message_id = channel.messages.len();
-    let message = Message::new(username.clone(), body.text.clone(), message_id);
+    let message = Message::new(
+        existing_user.username.clone(),
+        body.text.clone(),
+        message_id,
+    );
     channel.messages.push(message);
     (
         StatusCode::OK,
         Json(
-            json!({"channel": channel_name, "message_id": message_id, "username": username, "text": body.text}),
+            json!({"channel": channel_name, "message_id": message_id, "username": existing_user.username, "text": body.text}),
         ),
     )
 }
