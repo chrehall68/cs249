@@ -7,7 +7,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{FromRequestParts, Path, Query, State},
+    extract::{FromRequestParts, Path, Query, State, rejection::JsonRejection},
     http::{StatusCode, request::Parts},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -100,8 +100,15 @@ struct PostUserRequest {
 }
 async fn post_user(
     State(state): State<SharedState>,
-    Json(body): Json<PostUserRequest>,
+    body: Result<Json<PostUserRequest>, JsonRejection>,
 ) -> Result<Json<Value>, HttpServerError> {
+    let Ok(body) = body else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid request body; must be valid json with a username field".to_string(),
+        )
+            .into());
+    };
     let () = stateops::create_user(state, body.username.clone())?;
     Ok(Json(json!({"username": body.username.clone()})))
 }
@@ -148,8 +155,15 @@ async fn send_message(
     State(state): State<SharedState>,
     existing_user: ExistingUser,
     Path(channel_name): Path<String>,
-    Json(body): Json<SendMessageBody>,
+    body: Result<Json<SendMessageBody>, JsonRejection>,
 ) -> Result<impl IntoResponse, HttpServerError> {
+    let Ok(body) = body else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid request body; must be valid json with a text field".to_string(),
+        )
+            .into());
+    };
     let message_id = stateops::send_message(
         state,
         channel_name.clone(),
