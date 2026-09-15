@@ -1,5 +1,7 @@
+mod stateops;
+use stateops::{AppState, SharedState};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 
@@ -11,7 +13,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use clap::Parser;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -29,86 +31,43 @@ struct ServerCli {
     #[arg(long, default_value_t = discord_common::DEFAULT_HOST.to_string())]
     host: String,
 }
-
-#[derive(Serialize)]
-struct Message {
-    username: String,
-    text: String,
-    message_id: usize,
+// convert errors from stateops to http errors
+struct HttpServerError {
+    status: String,
+    message: String,
+    code: StatusCode,
 }
-impl Message {
-    pub fn new(username: String, text: String, message_id: usize) -> Self {
-        Self {
-            username,
-            text,
-            message_id,
+impl From<stateops::StateError> for HttpServerError {
+    fn from(e: stateops::StateError) -> Self {
+        HttpServerError {
+            status: "error".to_string(),
+            message: e.1,
+            code: e.0,
         }
     }
 }
-struct Channel {
-    users: HashSet<String>,
-    messages: Vec<Message>,
-}
-struct AppState {
-    users: HashSet<String>,
-    channels: HashMap<String, Channel>,
-}
-impl AppState {
-    pub fn new() -> Self {
-        Self {
-            users: HashSet::new(),
-            channels: HashMap::new(),
-        }
-    }
-}
-
-// Handlers get a clone of this `Arc`. The `Mutex` is what actually lets
-// multiple handlers mutate the same `AppState` safely.
-type SharedState = Arc<Mutex<AppState>>;
-
-// ==================================================
-// HTTP endpoints
-// ==================================================
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
-}
-#[derive(Deserialize)]
-struct PostUserRequest {
-    username: String,
-}
-async fn post_user(
-    State(state): State<SharedState>,
-    Json(body): Json<PostUserRequest>,
-) -> impl IntoResponse {
-    let mut state = state.lock().unwrap();
-    if state.users.contains(&body.username) {
+impl IntoResponse for HttpServerError {
+    fn into_response(self) -> Response {
         (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"User already exists"})),
+            self.code,
+            Json(
+                json!({"status": self.status, "code": self.code.as_u16(), "message": self.message}),
+            ),
         )
-    } else {
-        state.users.insert(body.username.clone());
-        (StatusCode::OK, Json(json!({"username": body.username})))
+            .into_response()
     }
 }
-async fn get_users(State(state): State<SharedState>) -> Json<Value> {
-    let state = state.lock().unwrap();
-    Json(json!({"users": state.users.iter().collect::<Vec<_>>()}))
-}
-async fn get_channels(State(state): State<SharedState>) -> Json<Value> {
-    let state = state.lock().unwrap();
-    Json(json!({"channels": state.channels.iter().map(|(k, _)| k).collect::<Vec<_>>()}))
-}
+// header extraction
 struct ExistingUser {
     username: String,
 }
-impl FromRequestParts<SharedState> for ExistingUser {
+impl<S> FromRequestParts<S> for ExistingUser
+where
+    S: Send + Sync,
+{
     type Rejection = Response;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &SharedState,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, _s: &S) -> Result<Self, Self::Rejection> {
         let Some(username_value) = parts.headers.get("username") else {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -123,118 +82,63 @@ impl FromRequestParts<SharedState> for ExistingUser {
             )
                 .into_response());
         };
-        let state = state.lock().unwrap();
-        if !state.users.contains(username) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"status": "error", "code": 400, "message":"User does not exist"})),
-            )
-                .into_response());
-        }
         Ok(ExistingUser {
             username: username.to_owned(),
         })
     }
 }
+
+// ==================================================
+// HTTP endpoints
+// ==================================================
+async fn health() -> Json<Value> {
+    Json(json!({"status": "ok"}))
+}
+#[derive(Deserialize)]
+struct PostUserRequest {
+    username: String,
+}
+async fn post_user(
+    State(state): State<SharedState>,
+    Json(body): Json<PostUserRequest>,
+) -> Result<Json<Value>, HttpServerError> {
+    let () = stateops::create_user(state, body.username.clone())?;
+    Ok(Json(json!({"username": body.username.clone()})))
+}
+async fn get_users(State(state): State<SharedState>) -> Json<Value> {
+    let users = stateops::get_users(state);
+    Json(json!({"users":users}))
+}
+async fn get_channels(State(state): State<SharedState>) -> Json<Value> {
+    let channels = stateops::get_channels(state);
+    Json(json!({"channels": channels}))
+}
 async fn join_chanel(
     State(state): State<SharedState>,
     existing_user: ExistingUser,
     Path(channel_name): Path<String>,
-) -> impl IntoResponse {
-    let mut state = state.lock().unwrap();
-    if !channel_name.starts_with('#') {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"Channel must start with #"})),
-        );
-    }
-    // we have a valid channel, now look it up
-    let channel = state
-        .channels
-        .entry(channel_name.clone())
-        .or_insert(Channel {
-            users: HashSet::new(),
-            messages: Vec::new(),
-        });
-    if channel.users.contains(&existing_user.username) {
-        // duplicate
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"User already in channel"})),
-        )
-    }
-    // otherwise, add the user to the channel
-    else {
-        channel.users.insert(existing_user.username.clone());
-        (
-            StatusCode::OK,
-            Json(
-                json!({"channel": channel_name, "username": existing_user.username, "joined": true}),
-            ),
-        )
-    }
+) -> Result<Json<Value>, HttpServerError> {
+    let () = stateops::join_channel(state, existing_user.username.clone(), channel_name.clone())?;
+    Ok(Json(
+        json!({"username": existing_user.username, "channel": channel_name, "joined": true}),
+    ))
 }
 async fn list_channel_users(
     State(state): State<SharedState>,
     Path(channel_name): Path<String>,
-) -> impl IntoResponse {
-    let state = state.lock().unwrap();
-    if !channel_name.starts_with('#') {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"Channel must start with #"})),
-        );
-    }
-    // we have a valid channel, now look it up
-    if !state.channels.contains_key(&channel_name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"Channel does not exist"})),
-        );
-    }
-    let channel = state.channels.get(&channel_name).unwrap();
-    (
-        StatusCode::OK,
-        Json(json!({"channel": channel_name, "users": channel.users.iter().collect::<Vec<_>>()})),
-    )
+) -> Result<impl IntoResponse, HttpServerError> {
+    let users = stateops::list_channel_users(state, channel_name.clone())?;
+    Ok(Json(json!({"users": users, "channel": channel_name})))
 }
 
 async fn leave_channel(
     State(state): State<SharedState>,
     Path((channel_name, username)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let mut state = state.lock().unwrap();
-    if !channel_name.starts_with('#') {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"Channel must start with #"})),
-        );
-    }
-    // we have a valid channel, now look it up
-    if !state.channels.contains_key(&channel_name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"Channel does not exist"})),
-        );
-    }
-    if !state.users.contains(&username) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"User does not exist"})),
-        );
-    }
-    let channel = state.channels.get_mut(&channel_name).unwrap();
-    if !channel.users.contains(&username) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"User not in channel"})),
-        );
-    }
-    channel.users.remove(&username);
-    (
-        StatusCode::OK,
-        Json(json!({"channel": channel_name, "username": username, "left": true})),
-    )
+) -> Result<impl IntoResponse, HttpServerError> {
+    let () = stateops::leave_channel(state, username.clone(), channel_name.clone())?;
+    Ok(Json(
+        json!({"channel": channel_name, "username": username, "left": true}),
+    ))
 }
 #[derive(Deserialize)]
 struct SendMessageBody {
@@ -245,86 +149,50 @@ async fn send_message(
     existing_user: ExistingUser,
     Path(channel_name): Path<String>,
     Json(body): Json<SendMessageBody>,
-) -> impl IntoResponse {
-    let mut state = state.lock().unwrap();
-    // verify that channel exists
-    if !channel_name.starts_with('#') {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"Channel must start with #"})),
-        );
-    }
-    if !state.channels.contains_key(&channel_name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"Channel does not exist"})),
-        );
-    }
-
-    // and verify that the user is part of the channel
-    let channel = state.channels.get_mut(&channel_name).unwrap();
-    if !channel.users.contains(&existing_user.username) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"User not in channel"})),
-        );
-    }
-    // user exists and is part of the channel -> send message
-    let message_id = channel.messages.len();
-    let message = Message::new(
+) -> Result<impl IntoResponse, HttpServerError> {
+    let message_id = stateops::send_message(
+        state,
+        channel_name.clone(),
         existing_user.username.clone(),
         body.text.clone(),
-        message_id,
-    );
-    channel.messages.push(message);
-    (
-        StatusCode::OK,
-        Json(
-            json!({"channel": channel_name, "message_id": message_id, "username": existing_user.username, "text": body.text}),
-        ),
-    )
+    )?;
+    Ok(Json(
+        json!({"channel": channel_name, "message_id": message_id, "username": existing_user.username, "text": body.text}),
+    ))
 }
 async fn get_messages(
     State(state): State<SharedState>,
     Path(channel_name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let state = state.lock().unwrap();
-    if !channel_name.starts_with('#') {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"Channel must start with #"})),
-        );
+) -> Result<impl IntoResponse, HttpServerError> {
+    let mut limit = None;
+    if let Some(lim) = params.get("limit")
+        && !lim.is_empty()
+    {
+        let Ok(lim) = lim.parse::<usize>() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Invalid limit! Limit must be a nonnegative integer".to_string(),
+            )
+                .into());
+        };
+        limit = Some(lim);
     }
-    // we have a valid channel, now look it up
-    if !state.channels.contains_key(&channel_name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"status": "error", "code": 400, "message":"Channel does not exist"})),
-        );
+    let mut offset = None;
+    if let Some(off) = params.get("offset")
+        && !off.is_empty()
+    {
+        let Ok(off) = off.parse::<usize>() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Invalid offset! Offset must be a nonnegative integer".to_string(),
+            )
+                .into());
+        };
+        offset = Some(off);
     }
-    let channel = state.channels.get(&channel_name).unwrap();
-    let limit = params
-        .get("limit")
-        .unwrap_or(&"20".to_owned())
-        .parse::<usize>()
-        .unwrap();
-    let offset = params
-        .get("offset")
-        .unwrap_or(&"0".to_owned())
-        .parse::<usize>()
-        .unwrap();
-    let messages = channel
-        .messages
-        .iter()
-        .rev()
-        .skip(offset)
-        .take(limit)
-        .collect::<Vec<_>>();
-    (
-        StatusCode::OK,
-        Json(json!({"channel": channel_name, "messages": messages})),
-    )
+    let messages = stateops::get_messages(state, channel_name.clone(), limit, offset)?;
+    Ok(Json(json!({"channel": channel_name, "messages": messages})))
 }
 
 #[tokio::main]
