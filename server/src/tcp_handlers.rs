@@ -265,10 +265,12 @@ pub fn create_task(state: SharedState, host: String, port: u16) -> JoinHandle<()
             let (socket, addr) = listener.accept().await.unwrap();
 
             // set keepalive
+            // since we only care about client failure detection, this acts as a ping-ack
+            // mechanism where, after 5 seconds of inactivity, the server will
+            // send a keepalive packet to the client to ensure the connection is still alive
             let keepalive = TcpKeepalive::new()
                 .with_time(Duration::from_secs(5))
-                .with_interval(Duration::from_secs(1))
-                .with_retries(3);
+                .with_interval(Duration::from_secs(1));
 
             let socket_ref = SockRef::from(&socket);
             socket_ref.set_tcp_keepalive(&keepalive).unwrap();

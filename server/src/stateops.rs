@@ -22,18 +22,20 @@ impl Message {
     }
 }
 pub struct Channel {
-    pub users: HashSet<String>,
-    pub messages: Vec<Message>,
+    users: HashSet<String>,
+    messages: Vec<Message>,
 }
 pub struct AppState {
-    pub users: HashSet<String>,
-    pub channels: HashMap<String, Channel>,
+    users: HashSet<String>,
+    channels: HashMap<String, Channel>,
+    next_message_id: usize,
 }
 impl AppState {
     pub fn new() -> Self {
         Self {
             users: HashSet::new(),
             channels: HashMap::new(),
+            next_message_id: 0,
         }
     }
 }
@@ -184,12 +186,16 @@ pub fn send_message(
     if !user_exists(state.clone(), &username) {
         return Err((StatusCode::NOT_FOUND, "User does not exist".to_owned()));
     }
+
     let mut state = state.lock().unwrap();
-    let channel = state.channels.get_mut(&channel_name).unwrap();
+    let channel = state.channels.get(&channel_name).unwrap();
     if !channel.users.contains(&username) {
         return Err((StatusCode::BAD_REQUEST, "User not in channel".to_owned()));
     }
-    let message_id = channel.messages.len();
+    let message_id = state.next_message_id;
+    state.next_message_id += 1;
+    // get channel mutably now
+    let channel = state.channels.get_mut(&channel_name).unwrap();
     let message = Message::new(username, text, message_id);
     channel.messages.push(message);
     Ok(message_id)
