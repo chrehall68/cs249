@@ -282,7 +282,8 @@ pub fn create_task(state: SharedState, host: String, port: u16) -> JoinHandle<()
             // send a keepalive packet to the client to ensure the connection is still alive
             let keepalive = TcpKeepalive::new()
                 .with_time(Duration::from_secs(5))
-                .with_interval(Duration::from_secs(1));
+                .with_interval(Duration::from_secs(1))
+                .with_retries(2);
 
             let socket_ref = SockRef::from(&socket);
             socket_ref.set_tcp_keepalive(&keepalive).unwrap();
