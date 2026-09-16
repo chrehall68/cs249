@@ -1,8 +1,10 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -167,6 +169,14 @@ enum SocketOperation {
     Close,
     Send(StateResult<Value>),
 }
+async fn handle_unexpected_close(state: TcpServerState) {
+    // must remove user from all channels
+    let state = state.lock().unwrap();
+    let Some(username) = state.user.clone() else {
+        return;
+    };
+    stateops::leave_all_channels(state.shared.clone(), username.clone());
+}
 async fn process_socket(state: SharedState, mut socket: TcpStream, addr: SocketAddr) {
     use SocketOperation::*;
     // do work with socket here
@@ -181,7 +191,21 @@ async fn process_socket(state: SharedState, mut socket: TcpStream, addr: SocketA
     }));
     let mut open = true;
     while open {
-        let n = socket.read(&mut buf).await.unwrap();
+        let n = match socket.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                // would happen if tcp keepalive fails
+                println!("error: {}", e);
+                handle_unexpected_close(state.clone()).await;
+                break;
+            }
+        };
+        println!("n: {}", n);
+        if n == 0 {
+            // unexpected close
+            handle_unexpected_close(state.clone()).await;
+            break;
+        }
         cur_line.push_str(std::str::from_utf8(&buf[0..n]).unwrap());
         while let Some((line, rest)) = cur_line.split_once("\n") {
             println!("line: {}", line);
@@ -216,7 +240,6 @@ async fn process_socket(state: SharedState, mut socket: TcpStream, addr: SocketA
             match command {
                 Close => {
                     println!("closing socket");
-                    socket.shutdown().await.unwrap();
                     open = false;
                     break; // don't process any more messages
                 }
@@ -229,7 +252,7 @@ async fn process_socket(state: SharedState, mut socket: TcpStream, addr: SocketA
                         }
                     };
                     socket
-                        .write_all(to_send.to_string().as_bytes())
+                        .write_all(format!("{}\n", to_send.to_string()).as_bytes())
                         .await
                         .unwrap();
                 }
@@ -238,6 +261,7 @@ async fn process_socket(state: SharedState, mut socket: TcpStream, addr: SocketA
             cur_line = rest.to_owned();
         }
     }
+    socket.shutdown().await.unwrap();
     println!("Exiting for socket: {}", addr);
 }
 
@@ -251,6 +275,19 @@ pub fn create_task(state: SharedState, host: String, port: u16) -> JoinHandle<()
         loop {
             println!("listening for connection");
             let (socket, addr) = listener.accept().await.unwrap();
+
+            // set keepalive
+            // since we only care about client failure detection, this acts as a ping-ack
+            // mechanism where, after 5 seconds of inactivity, the server will
+            // send a keepalive packet to the client to ensure the connection is still alive
+            let keepalive = TcpKeepalive::new()
+                .with_time(Duration::from_secs(5))
+                .with_interval(Duration::from_secs(1))
+                .with_retries(2);
+
+            let socket_ref = SockRef::from(&socket);
+            socket_ref.set_tcp_keepalive(&keepalive).unwrap();
+
             println!("received connection");
             tokio::spawn(process_socket(state.clone(), socket, addr));
         }

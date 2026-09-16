@@ -22,18 +22,24 @@ impl Message {
     }
 }
 pub struct Channel {
-    pub users: HashSet<String>,
-    pub messages: Vec<Message>,
+    users: HashSet<String>,
+    messages: Vec<Message>,
 }
 pub struct AppState {
-    pub users: HashSet<String>,
-    pub channels: HashMap<String, Channel>,
+    users: HashSet<String>,
+    channels: HashMap<String, Channel>,
+    // username -> channels
+    // if a user exists, then they will have an entry in this hashmap
+    user_channels: HashMap<String, HashSet<String>>,
+    next_message_id: usize,
 }
 impl AppState {
     pub fn new() -> Self {
         Self {
             users: HashSet::new(),
             channels: HashMap::new(),
+            user_channels: HashMap::new(),
+            next_message_id: 0,
         }
     }
 }
@@ -67,6 +73,7 @@ pub fn create_user(state: SharedState, username: String) -> StateResult<()> {
     } else {
         let mut state = state.lock().unwrap();
         state.users.insert(username.clone());
+        state.user_channels.insert(username.clone(), HashSet::new());
         Ok(())
     }
 }
@@ -119,6 +126,11 @@ pub fn join_channel(state: SharedState, username: String, channel_name: String) 
     } else {
         // otherwise, add the user to the channel
         channel.users.insert(username.clone());
+        state
+            .user_channels
+            .get_mut(&username)
+            .unwrap()
+            .insert(channel_name.clone());
         Ok(())
     }
 }
@@ -160,7 +172,30 @@ pub fn leave_channel(
         return Err((StatusCode::BAD_REQUEST, "User not in channel".to_owned()));
     }
     channel.users.remove(&username);
+    state
+        .user_channels
+        .get_mut(&username)
+        .unwrap()
+        .remove(&channel_name);
     Ok(())
+}
+
+pub fn leave_all_channels(state: SharedState, username: String) {
+    if !user_exists(state.clone(), &username) {
+        return;
+    }
+    // since the user exists, then we can simply leave all channels
+    // we know that each should succeed because each channel should already exist
+    let channels = state
+        .lock()
+        .unwrap()
+        .user_channels
+        .get(&username)
+        .unwrap()
+        .clone(); // clone to avoid borrow
+    for channel in channels {
+        leave_channel(state.clone(), username.clone(), channel.clone()).unwrap();
+    }
 }
 // ==============================
 // Messages
@@ -184,12 +219,16 @@ pub fn send_message(
     if !user_exists(state.clone(), &username) {
         return Err((StatusCode::NOT_FOUND, "User does not exist".to_owned()));
     }
+
     let mut state = state.lock().unwrap();
-    let channel = state.channels.get_mut(&channel_name).unwrap();
+    let channel = state.channels.get(&channel_name).unwrap();
     if !channel.users.contains(&username) {
         return Err((StatusCode::BAD_REQUEST, "User not in channel".to_owned()));
     }
-    let message_id = channel.messages.len();
+    let message_id = state.next_message_id;
+    state.next_message_id += 1;
+    // get channel mutably now
+    let channel = state.channels.get_mut(&channel_name).unwrap();
     let message = Message::new(username, text, message_id);
     channel.messages.push(message);
     Ok(message_id)
