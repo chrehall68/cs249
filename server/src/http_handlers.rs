@@ -207,6 +207,8 @@ fn build_app(state: SharedState) -> Router {
             post(send_message).get(get_messages),
         )
         .with_state(state)
+    // TODO - I think we need to add error handling for
+    // if the route doesn't exist, or if the method is invalid
 }
 pub fn create_task(state: SharedState, host: String, port: u16) -> JoinHandle<()> {
     tokio::spawn(async move {
