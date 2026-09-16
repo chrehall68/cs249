@@ -1,14 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["server", "client", "discord-common"]
+members = ["server", "client"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-axum = "0.8.9"
 clap = { version = "4.6.6", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full"] }
-discord-common = { path = "discord-common" }

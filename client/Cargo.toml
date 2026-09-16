@@ -6,4 +6,3 @@ edition.workspace = true
 [dependencies]
 clap = { workspace = true }
 tokio = { workspace = true }
-discord-common = { workspace = true }
