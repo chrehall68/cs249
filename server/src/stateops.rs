@@ -56,7 +56,7 @@ pub fn get_users(state: SharedState) -> Vec<String> {
     let state = state.lock().unwrap();
     state.users.iter().map(|k| k.clone()).collect::<Vec<_>>()
 }
-fn user_exists(state: SharedState, username: &str) -> bool {
+pub fn user_exists(state: SharedState, username: &str) -> bool {
     let state = state.lock().unwrap();
     state.users.contains(username)
 }
