@@ -548,6 +548,7 @@ dependencies = [
  "discord-common",
  "serde",
  "serde_json",
+ "socket2",
  "tokio",
 ]
 

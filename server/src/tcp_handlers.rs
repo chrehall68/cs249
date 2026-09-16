@@ -1,8 +1,10 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -181,7 +183,17 @@ async fn process_socket(state: SharedState, mut socket: TcpStream, addr: SocketA
     }));
     let mut open = true;
     while open {
-        let n = socket.read(&mut buf).await.unwrap();
+        let n = match socket.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                println!("error: {}", e);
+                break;
+            }
+        };
+        println!("n: {}", n);
+        if n == 0 {
+            break;
+        }
         cur_line.push_str(std::str::from_utf8(&buf[0..n]).unwrap());
         while let Some((line, rest)) = cur_line.split_once("\n") {
             println!("line: {}", line);
@@ -251,6 +263,16 @@ pub fn create_task(state: SharedState, host: String, port: u16) -> JoinHandle<()
         loop {
             println!("listening for connection");
             let (socket, addr) = listener.accept().await.unwrap();
+
+            // set keepalive
+            let keepalive = TcpKeepalive::new()
+                .with_time(Duration::from_secs(5))
+                .with_interval(Duration::from_secs(1))
+                .with_retries(3);
+
+            let socket_ref = SockRef::from(&socket);
+            socket_ref.set_tcp_keepalive(&keepalive).unwrap();
+
             println!("received connection");
             tokio::spawn(process_socket(state.clone(), socket, addr));
         }
