@@ -25,7 +25,7 @@ fn handle_register(state: TcpServerState, line: &str) -> StateResult<Value> {
     }
     let state = state.lock().unwrap();
     let username = parts[1].to_owned();
-    let () = stateops::create_user(state.shared.clone(), username.clone())?;
+    stateops::create_user(state.shared.clone(), username.clone())?;
     Ok(json! ({"status": "ok", "operation":"register", "username":username}))
 }
 
@@ -68,6 +68,101 @@ fn handle_logout(state: TcpServerState, line: &str) -> StateResult<Value> {
     state.user = None;
     Ok(json! ({"status": "ok", "operation":"logout", "username":username}))
 }
+fn handle_join(state: TcpServerState, line: &str) -> StateResult<Value> {
+    let parts = line.split(" ").collect::<Vec<_>>();
+    if parts.len() != 2 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid join command; expected `JOIN <channel>`".to_string(),
+        ));
+    }
+    let channel = parts[1].to_owned();
+    let state = state.lock().unwrap();
+    let Some(username) = state.user.clone() else {
+        return Err((StatusCode::BAD_REQUEST, "User is not logged in".to_string()));
+    };
+    stateops::join_channel(state.shared.clone(), username.clone(), channel.clone())?;
+    Ok(json! ({"status": "ok", "operation":"join", "channel":channel, "username": username}))
+}
+fn handle_leave(state: TcpServerState, line: &str) -> StateResult<Value> {
+    let parts = line.split(" ").collect::<Vec<_>>();
+    if parts.len() != 2 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid leave command; expected `LEAVE <channel>`".to_string(),
+        ));
+    }
+    let channel = parts[1].to_owned();
+    let state = state.lock().unwrap();
+    let Some(username) = state.user.clone() else {
+        return Err((StatusCode::BAD_REQUEST, "User is not logged in".to_string()));
+    };
+    stateops::leave_channel(state.shared.clone(), username.clone(), channel.clone())?;
+    Ok(json! ({"status": "ok", "operation":"leave", "channel":channel, "username": username}))
+}
+fn handle_list_channels(state: TcpServerState, line: &str) -> StateResult<Value> {
+    let parts = line.split(" ").collect::<Vec<_>>();
+    if parts.len() != 2 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid list channels command; expected `LIST CHANNELS`".to_string(),
+        ));
+    }
+    let state = state.lock().unwrap();
+    let channels = stateops::get_channels(state.shared.clone());
+    Ok(json! ({"status": "ok", "operation":"list_channels", "channels":channels}))
+}
+fn handle_list_users(state: TcpServerState, line: &str) -> StateResult<Value> {
+    let parts = line.split(" ").collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid list users command; expected `LIST USERS <channel>`".to_string(),
+        ));
+    }
+    let channel = parts[2].to_owned();
+    let state = state.lock().unwrap();
+    let users = stateops::list_channel_users(state.shared.clone(), channel.clone())?;
+    Ok(json! ({"status": "ok", "operation":"list_users", "channel":channel, "users":users}))
+}
+fn handle_send(state: TcpServerState, line: &str) -> StateResult<Value> {
+    let (_, parts) = line.split_once(" ").unwrap();
+    let Some((channel, message)) = parts.split_once(" ") else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid send command; expected `SEND <channel> <message>`".to_string(),
+        ));
+    };
+    let state = state.lock().unwrap();
+    let Some(username) = state.user.clone() else {
+        return Err((StatusCode::BAD_REQUEST, "User is not logged in".to_string()));
+    };
+    let message_id = stateops::send_message(
+        state.shared.clone(),
+        channel.to_owned(),
+        username.clone(),
+        message.to_owned(),
+    )?;
+    Ok(json! ({"status": "ok", "operation":"send", "message_id": message_id}))
+}
+fn handle_history(state: TcpServerState, line: &str) -> StateResult<Value> {
+    let (_, parts) = line.split_once(" ").unwrap();
+    let (channel, limit) = match parts.split_once(" ") {
+        Some((channel, limit)) => {
+            let Ok(limit) = limit.parse::<usize>() else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Invalid limit! Limit must be a nonnegative integer".to_string(),
+                ));
+            };
+            (channel, Some(limit))
+        }
+        None => (parts.trim(), None),
+    };
+    let state = state.lock().unwrap();
+    let messages = stateops::get_messages(state.shared.clone(), channel.to_owned(), limit, None)?;
+    Ok(json! ({"status": "ok", "operation":"history", "messages":messages}))
+}
 enum SocketOperation {
     Close,
     Send(StateResult<Value>),
@@ -98,6 +193,18 @@ async fn process_socket(state: SharedState, mut socket: TcpStream, addr: SocketA
                 Send(handle_login(state.clone(), line))
             } else if line.starts_with("LOGOUT") {
                 Send(handle_logout(state.clone(), line))
+            } else if line.starts_with("JOIN") {
+                Send(handle_join(state.clone(), line))
+            } else if line.starts_with("LEAVE") {
+                Send(handle_leave(state.clone(), line))
+            } else if line.starts_with("LIST CHANNELS") {
+                Send(handle_list_channels(state.clone(), line))
+            } else if line.starts_with("LIST USERS") {
+                Send(handle_list_users(state.clone(), line))
+            } else if line.starts_with("SEND") {
+                Send(handle_send(state.clone(), line))
+            } else if line.starts_with("HISTORY") {
+                Send(handle_history(state.clone(), line))
             } else if line.starts_with("QUIT") {
                 Close
             } else {
