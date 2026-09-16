@@ -241,7 +241,7 @@ async fn process_socket(state: SharedState, mut socket: TcpStream, addr: SocketA
                         }
                     };
                     socket
-                        .write_all(to_send.to_string().as_bytes())
+                        .write_all(format!("{}\n", to_send.to_string()).as_bytes())
                         .await
                         .unwrap();
                 }
