@@ -32,6 +32,9 @@ async fn main() {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap();
         socket.write_all(input.as_bytes()).await.unwrap();
+        if input.trim() == "QUIT" {
+            break;
+        }
 
         // then get response
         while !cur_line.contains("\n") {
@@ -42,4 +45,6 @@ async fn main() {
         println!("{}", line);
         cur_line = String::from(rest);
     }
+    socket.shutdown().await.unwrap();
+    println!("disconnected");
 }

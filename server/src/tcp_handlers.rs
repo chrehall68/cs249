@@ -169,6 +169,14 @@ enum SocketOperation {
     Close,
     Send(StateResult<Value>),
 }
+async fn handle_unexpected_close(state: TcpServerState) {
+    // must remove user from all channels
+    let state = state.lock().unwrap();
+    let Some(username) = state.user.clone() else {
+        return;
+    };
+    stateops::leave_all_channels(state.shared.clone(), username.clone());
+}
 async fn process_socket(state: SharedState, mut socket: TcpStream, addr: SocketAddr) {
     use SocketOperation::*;
     // do work with socket here
@@ -186,12 +194,16 @@ async fn process_socket(state: SharedState, mut socket: TcpStream, addr: SocketA
         let n = match socket.read(&mut buf).await {
             Ok(n) => n,
             Err(e) => {
+                // would happen if tcp keepalive fails
                 println!("error: {}", e);
+                handle_unexpected_close(state.clone()).await;
                 break;
             }
         };
         println!("n: {}", n);
         if n == 0 {
+            // unexpected close
+            handle_unexpected_close(state.clone()).await;
             break;
         }
         cur_line.push_str(std::str::from_utf8(&buf[0..n]).unwrap());
@@ -228,7 +240,6 @@ async fn process_socket(state: SharedState, mut socket: TcpStream, addr: SocketA
             match command {
                 Close => {
                     println!("closing socket");
-                    socket.shutdown().await.unwrap();
                     open = false;
                     break; // don't process any more messages
                 }
@@ -250,6 +261,7 @@ async fn process_socket(state: SharedState, mut socket: TcpStream, addr: SocketA
             cur_line = rest.to_owned();
         }
     }
+    socket.shutdown().await.unwrap();
     println!("Exiting for socket: {}", addr);
 }
 
