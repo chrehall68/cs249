@@ -191,6 +191,25 @@ async fn get_messages(
     Ok(Json(json!({"channel": channel_name, "messages": messages})))
 }
 
+async fn not_found(
+    State(_state): State<SharedState>,
+) -> Result<impl IntoResponse, HttpServerError> {
+    Err::<Json<Value>, HttpServerError>(
+        (StatusCode::NOT_FOUND, "Route not found".to_string()).into(),
+    )
+}
+
+async fn method_not_allowed(
+    State(_state): State<SharedState>,
+) -> Result<impl IntoResponse, HttpServerError> {
+    Err::<Json<Value>, HttpServerError>(
+        (
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed".to_string(),
+        )
+            .into(),
+    )
+}
 fn build_app(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -206,9 +225,10 @@ fn build_app(state: SharedState) -> Router {
             "/channels/{channel}/messages",
             post(send_message).get(get_messages),
         )
+        // handling so that we return json, as requested, on these errors
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
-    // TODO - I think we need to add error handling for
-    // if the route doesn't exist, or if the method is invalid
 }
 pub fn create_task(state: SharedState, host: String, port: u16) -> JoinHandle<()> {
     tokio::spawn(async move {
