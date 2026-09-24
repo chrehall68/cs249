@@ -67,3 +67,18 @@ having a separate thread/callback for heartbeats and either:
 
 - having a separate socket for heartbeats
 - OR reusing the existing one and editing our application-level TCP protocol to account for custom
+
+## Video Timestamps
+
+| Requirement               | Video Timestamp |
+| ------------------------- | --------------- |
+| Server startup            | 0:10            |
+| Health endpoint           | 0:22            |
+| User creation             | 0:30            |
+| Channel membership        | 0:53            |
+| Message creation          | 1:10            |
+| Message history           | 1:21            |
+| TCP interface             | 3:56            |
+| Shared TCP and HTTP state | 4:44            |
+| Concurrent clients        | 5:10            |
+| Failure detection         | 7:30            |

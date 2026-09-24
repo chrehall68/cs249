@@ -50,7 +50,7 @@ where
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, _s: &S) -> Result<Self, Self::Rejection> {
-        let Some(username_value) = parts.headers.get("username") else {
+        let Some(username_value) = parts.headers.get("X-User") else {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(json!({"status": "error", "code": 400, "message":"Missing username header"})),
