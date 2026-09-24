@@ -1,6 +1,9 @@
 FROM rust:1.98-alpine AS builder
 WORKDIR /usr/src/app
-COPY . .
+COPY client client
+COPY server server
+COPY Cargo.toml .
+COPY Cargo.lock .
 RUN cargo build --release
 FROM debian:buster-slim
 WORKDIR /usr/src/app

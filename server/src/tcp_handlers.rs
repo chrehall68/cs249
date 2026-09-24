@@ -200,7 +200,6 @@ async fn process_socket(state: SharedState, mut socket: TcpStream, addr: SocketA
                 break;
             }
         };
-        println!("n: {}", n);
         if n == 0 {
             // unexpected close
             handle_unexpected_close(state.clone()).await;
@@ -239,12 +238,10 @@ async fn process_socket(state: SharedState, mut socket: TcpStream, addr: SocketA
             // handle socket operations
             match command {
                 Close => {
-                    println!("closing socket");
                     open = false;
                     break; // don't process any more messages
                 }
                 Send(val) => {
-                    println!("sending: {:?}", val);
                     let to_send = match val {
                         Ok(val) => val,
                         Err(e) => {
