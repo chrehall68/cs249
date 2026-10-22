@@ -1,18 +1,18 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedWriteHalf, WriteHalf};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use crate::config::Config;
-use crate::stateops::{SharedState, set_server_state};
+use crate::stateops::{SharedState, get_server_state, set_server_state};
 
 /// if the peer fails to respond to heartbeats, or explicitly sends a disconnect,
 /// then Value is None. Otherwise, the value will be a some
@@ -71,7 +71,7 @@ async fn send_pings_task(
                     pending_heartbeats.remove(&cur_key);
                     missed_heartbeats.fetch_add(1, Ordering::SeqCst);
                     if missed_heartbeats.load(Ordering::SeqCst) == 3 {
-                        println!("Peer missed 3 heartbeats, disconnecting");
+                        println!("Peer {peer_id} missed 3 heartbeats, disconnecting");
                         set_server_state(app_state, peer_id, false);
                     }
                 }
@@ -92,24 +92,35 @@ async fn send_pings_task(
             })
         };
 
-        sender
-            .send(MessageToSend {
-                message: json!({"type":"PING", "from":id.clone()}),
-                callback: Some(Box::new(on_ping_callback)),
-                is_response: false,
-            })
-            .await
-            .unwrap();
+        println!("Sending ping to {peer_id}");
+        if get_server_state(app_state.clone(), &peer_id.clone()) {
+            sender
+                .send(MessageToSend {
+                    message: json!({"type":"PING", "from":id.clone()}),
+                    callback: Some(Box::new(on_ping_callback)),
+                    is_response: false,
+                })
+                .await
+                .unwrap();
+        } else {
+            println!("Peer {peer_id} is disconnected; stopping");
+            break;
+        }
     }
 }
 async fn send_message_task(
     mut socket: OwnedWriteHalf,
+    app_state: SharedState,
+    peer_id: String,
     peer_state: SharedPeerState,
     mut receiver: Receiver<MessageToSend>,
 ) {
     loop {
         let message_str = {
-            let mut message = receiver.recv().await.unwrap();
+            let mut message = match receiver.recv().await {
+                Some(message) => message,
+                None => break,
+            };
             let mut peer_state = peer_state.lock().unwrap();
             if !message.is_response {
                 // attach a sequence number
@@ -123,8 +134,16 @@ async fn send_message_task(
             }
             format!("{}\n", message.message)
         };
-        println!("Sending: {}", message_str);
-        socket.write_all(&message_str.as_bytes()).await.unwrap();
+
+        match socket.write_all(&message_str.as_bytes()).await {
+            Ok(_) => (),
+            Err(e) => {
+                // happens if peer disconnects
+                println!("Error sending message: {}", e);
+                set_server_state(app_state.clone(), peer_id.clone(), false);
+                break;
+            }
+        }
     }
 }
 
@@ -148,8 +167,15 @@ async fn peer_task(mut socket: TcpStream, state: SharedState, id: String, peer_i
         let (line, rest) = cur_line.split_once("\n").unwrap();
         let first_message: Value = serde_json::from_str(line).unwrap();
         cur_line = String::from(rest);
-        first_message.get("id").unwrap().to_string()
+        first_message
+            .get("id")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
     };
+
+    println!("connected to peer {}", peer_id);
 
     // then now that we know who peer is, do regular connection management
     let (sender, receiver) = tokio::sync::mpsc::channel(100);
@@ -163,16 +189,27 @@ async fn peer_task(mut socket: TcpStream, state: SharedState, id: String, peer_i
         sender.clone(),
     ));
     let (mut reader, writer) = socket.into_split();
-    tokio::spawn(send_message_task(writer, peer_state.clone(), receiver));
+    tokio::spawn(send_message_task(
+        writer,
+        state.clone(),
+        peer_id.clone(),
+        peer_state.clone(),
+        receiver,
+    ));
     loop {
         // then get response
         while !cur_line.contains("\n") {
             let n = reader.read(&mut buf).await.unwrap();
+            if n == 0 {
+                // peer disconnected
+                set_server_state(state.clone(), peer_id.clone(), false);
+                return;
+            }
             cur_line.push_str(std::str::from_utf8(&buf[0..n]).unwrap());
         }
         let (line, rest) = cur_line.split_once("\n").unwrap();
         let value: Value = serde_json::from_str(line).unwrap();
-        println!("{}", value);
+        println!("Received {}", value);
         cur_line = String::from(rest);
 
         // then dispatch

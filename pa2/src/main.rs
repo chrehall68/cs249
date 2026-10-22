@@ -39,7 +39,11 @@ async fn main() {
     println!("server config: {:?}", server_config);
     println!("peers: {:?}", config);
     let state: SharedState = Arc::new(Mutex::new(AppState::from(cli.id.clone(), &config)));
-    // let t1 = http_handlers::create_task(state.clone(), cli.host.clone(), cli.http_port);
+    let t1 = http_handlers::create_task(
+        state.clone(),
+        server_config.host.clone(),
+        server_config.http_port,
+    );
     let t2 = tcp_handlers::create_task(
         state.clone(),
         config.clone(),
@@ -48,6 +52,6 @@ async fn main() {
         cli.id.clone(),
     )
     .await;
-    // t1.await.unwrap();
+    t1.await.unwrap();
     t2.await.unwrap();
 }

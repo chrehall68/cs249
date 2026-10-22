@@ -222,6 +222,7 @@ async fn method_not_allowed(
 fn build_app(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/servers", get(servers))
         .route("/users", post(post_user).get(get_users))
         .route("/channels", get(get_channels))
         .route("/channels/{channel}/members", post(join_chanel))
