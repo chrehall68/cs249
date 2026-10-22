@@ -1,0 +1,25 @@
+{
+  "servers": [
+    {
+      "id": "A",
+      "host": "127.0.0.1",
+      "http_port": 8101,
+      "peer_port": 9101,
+      "priority": 1
+    },
+    {
+      "id": "B",
+      "host": "127.0.0.1",
+      "http_port": 8102,
+      "peer_port": 9102,
+      "priority": 2
+    },
+    {
+      "id": "C",
+      "host": "127.0.0.1",
+      "http_port": 8103,
+      "peer_port": 9103,
+      "priority": 3
+    }
+  ]
+}
