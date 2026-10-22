@@ -524,7 +524,6 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
- "socket2",
  "tokio",
 ]
 

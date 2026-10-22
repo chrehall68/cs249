@@ -3,11 +3,9 @@ mod http_handlers;
 mod stateops;
 mod tcp_handlers;
 use clap::Parser;
-use config::Server;
 use stateops::{AppState, SharedState};
 use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 

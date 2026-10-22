@@ -1,16 +1,132 @@
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::http::StatusCode;
 use serde_json::{Value, json};
-use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedWriteHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 
 use crate::config::Config;
-use crate::stateops::{self, SharedState, StateResult};
+use crate::stateops::{SharedState, set_server_state};
+
+/// if the peer fails to respond to heartbeats, or explicitly sends a disconnect,
+/// then Value is None. Otherwise, the value will be a some
+type Callback = Box<dyn FnMut(Option<Value>) + Send>;
+
+// things to send to the other peer
+// and if we get a response, then we might want to do something
+// and if peer fails to respond to heartbeats, might want to know as well
+struct MessageToSend {
+    message: Value,
+    callback: Option<Callback>,
+    is_response: bool,
+}
+struct PeerState {
+    sequence_num: usize,
+    seq_to_callback: HashMap<usize, Callback>,
+}
+impl PeerState {
+    fn new() -> Self {
+        PeerState {
+            sequence_num: 0,
+            seq_to_callback: HashMap::new(),
+        }
+    }
+}
+type SharedPeerState = Arc<Mutex<PeerState>>;
+
+async fn send_pings_task(
+    app_state: SharedState,
+    id: String,
+    peer_id: String,
+    sender: Sender<MessageToSend>,
+) {
+    let missed_heartbeats = Arc::new(AtomicUsize::new(0));
+    let pending_heartbeats = Arc::new(Mutex::new(HashSet::new()));
+    let mut key = 0;
+
+    loop {
+        // wait 2 seconds
+        sleep(Duration::from_secs(2)).await;
+        // set up acknowledgement machinery
+        let cur_key = key;
+        key += 1;
+        pending_heartbeats.clone().lock().unwrap().insert(cur_key);
+
+        // set up timeout
+        {
+            let pending_heartbeats = pending_heartbeats.clone();
+            let missed_heartbeats = missed_heartbeats.clone();
+            let app_state = app_state.clone();
+            let peer_id = peer_id.clone();
+            tokio::spawn(async move {
+                sleep(Duration::from_secs(2)).await;
+                let mut pending_heartbeats = pending_heartbeats.lock().unwrap();
+                if pending_heartbeats.contains(&cur_key) {
+                    pending_heartbeats.remove(&cur_key);
+                    missed_heartbeats.fetch_add(1, Ordering::SeqCst);
+                    if missed_heartbeats.load(Ordering::SeqCst) == 3 {
+                        println!("Peer missed 3 heartbeats, disconnecting");
+                        set_server_state(app_state, peer_id, false);
+                    }
+                }
+            });
+        }
+
+        // and set up callback
+        let on_ping_callback: Callback = {
+            let pending_heartbeats = pending_heartbeats.clone();
+            let missed_heartbeats = missed_heartbeats.clone();
+            Box::new(move |_| {
+                println!("Received heartbeat");
+                let mut pending_heartbeats = pending_heartbeats.lock().unwrap();
+                if pending_heartbeats.contains(&cur_key) {
+                    pending_heartbeats.remove(&cur_key);
+                    missed_heartbeats.store(0, Ordering::SeqCst);
+                }
+            })
+        };
+
+        sender
+            .send(MessageToSend {
+                message: json!({"type":"PING", "from":id.clone()}),
+                callback: Some(Box::new(on_ping_callback)),
+                is_response: false,
+            })
+            .await
+            .unwrap();
+    }
+}
+async fn send_message_task(
+    mut socket: OwnedWriteHalf,
+    peer_state: SharedPeerState,
+    mut receiver: Receiver<MessageToSend>,
+) {
+    loop {
+        let message_str = {
+            let mut message = receiver.recv().await.unwrap();
+            let mut peer_state = peer_state.lock().unwrap();
+            if !message.is_response {
+                // attach a sequence number
+                message.message["sequence_number"] = json!(peer_state.sequence_num + 1);
+                peer_state.sequence_num += 1;
+            }
+            message.message["is_response"] = json!(message.is_response);
+            if let Some(callback) = message.callback {
+                let seq_num = peer_state.sequence_num;
+                peer_state.seq_to_callback.insert(seq_num, callback);
+            }
+            format!("{}\n", message.message)
+        };
+        println!("Sending: {}", message_str);
+        socket.write_all(&message_str.as_bytes()).await.unwrap();
+    }
+}
 
 async fn peer_task(mut socket: TcpStream, state: SharedState, id: String, peer_id: Option<String>) {
     let mut buf = [0; 1024];
@@ -20,10 +136,8 @@ async fn peer_task(mut socket: TcpStream, state: SharedState, id: String, peer_i
         // start by sending our ID that way receiving knows who we are
         // since the port that this connecting socket runs on on our machine isn't necessarily our peer port
         let intro_message = json!({"id":id});
-        socket
-            .write_all(&intro_message.to_string().as_bytes())
-            .await
-            .unwrap();
+        let intro_message = format!("{intro_message}\n");
+        socket.write_all(&intro_message.as_bytes()).await.unwrap();
         peer_id
     } else {
         // we don't know who our peer is, but we know we can get it as the first message
@@ -32,21 +146,58 @@ async fn peer_task(mut socket: TcpStream, state: SharedState, id: String, peer_i
             cur_line.push_str(std::str::from_utf8(&buf[0..n]).unwrap());
         }
         let (line, rest) = cur_line.split_once("\n").unwrap();
-        let first_message: Value = line.into();
+        let first_message: Value = serde_json::from_str(line).unwrap();
         cur_line = String::from(rest);
         first_message.get("id").unwrap().to_string()
     };
 
     // then now that we know who peer is, do regular connection management
+    let (sender, receiver) = tokio::sync::mpsc::channel(100);
+    let peer_state = Arc::new(Mutex::new(PeerState::new()));
+
+    // spawn background tasks
+    tokio::spawn(send_pings_task(
+        state.clone(),
+        id.clone(),
+        peer_id.clone(),
+        sender.clone(),
+    ));
+    let (mut reader, writer) = socket.into_split();
+    tokio::spawn(send_message_task(writer, peer_state.clone(), receiver));
     loop {
         // then get response
         while !cur_line.contains("\n") {
-            let n = socket.read(&mut buf).await.unwrap();
+            let n = reader.read(&mut buf).await.unwrap();
             cur_line.push_str(std::str::from_utf8(&buf[0..n]).unwrap());
         }
         let (line, rest) = cur_line.split_once("\n").unwrap();
-        println!("{}", line);
+        let value: Value = serde_json::from_str(line).unwrap();
+        println!("{}", value);
         cur_line = String::from(rest);
+
+        // then dispatch
+        if value.get("is_response").unwrap().as_bool().unwrap() {
+            // it's a response
+            let seq_num = value.get("sequence_number").unwrap().as_u64().unwrap();
+            let seq_num = seq_num as usize;
+            let callback = peer_state.lock().unwrap().seq_to_callback.remove(&seq_num);
+            if let Some(mut callback) = callback {
+                callback(Some(value));
+            }
+        } else {
+            // it's a request
+            let request_type = value.get("type").unwrap().as_str().unwrap();
+            if request_type == "PING" {
+                // respond with PONG
+                sender.send(
+                    MessageToSend{
+                        message: json!({"type":"PONG", "from":id.clone(), "sequence_number":value.get("sequence_number")}),
+                    callback: None,
+                    is_response: true,
+                    }
+                ).await.unwrap();
+            }
+        }
     }
 }
 
