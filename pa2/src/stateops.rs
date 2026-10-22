@@ -6,7 +6,7 @@ use std::{
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::config::{Config, Server};
 
 #[derive(Serialize, Clone)]
 pub struct Message {
@@ -27,28 +27,41 @@ pub struct Channel {
     users: HashSet<String>,
     messages: Vec<Message>,
 }
+#[derive(Clone)]
+pub struct ServerWithState {
+    pub server: Server,
+    pub is_alive: bool,
+}
 pub struct AppState {
-    id: String,
     users: HashSet<String>,
     channels: HashMap<String, Channel>,
     // username -> channels
     // if a user exists, then they will have an entry in this hashmap
     user_channels: HashMap<String, HashSet<String>>,
     next_message_id: usize,
-    server_states: HashMap<String, bool>,
+    server_states: HashMap<String, ServerWithState>,
+    leader: String,
 }
 impl AppState {
     pub fn from(id: String, config: &Config) -> Self {
         Self {
-            id,
             users: HashSet::new(),
             channels: HashMap::new(),
             user_channels: HashMap::new(),
             next_message_id: 0,
             server_states: config
                 .iter()
-                .map(|server| (server.id.clone(), true))
+                .map(|server| {
+                    (
+                        server.id.clone(),
+                        ServerWithState {
+                            server: server.clone(),
+                            is_alive: true,
+                        },
+                    )
+                })
                 .collect(),
+            leader: "C".to_owned(),
         }
     }
 }
@@ -69,15 +82,23 @@ pub type StateResult<T> = Result<T, StateError>;
 // ==============================
 pub fn set_server_state(state: SharedState, server: String, is_alive: bool) {
     let mut state = state.lock().unwrap();
-    state.server_states.insert(server, is_alive);
+    state.server_states.get_mut(&server).unwrap().is_alive = is_alive;
 }
 pub fn get_server_state(state: SharedState, server: &String) -> bool {
     let state = state.lock().unwrap();
-    *state.server_states.get(server).unwrap()
+    state.server_states.get(server).unwrap().is_alive
 }
-pub fn get_server_states(state: SharedState) -> Vec<(String, bool)> {
+pub fn get_server_states(state: SharedState) -> Vec<ServerWithState> {
     let state = state.lock().unwrap();
-    state.server_states.clone().into_iter().collect()
+    state.server_states.clone().into_values().collect()
+}
+pub fn set_leader(state: SharedState, leader: String) {
+    let mut state = state.lock().unwrap();
+    state.leader = leader;
+}
+pub fn get_leader(state: SharedState) -> String {
+    let state = state.lock().unwrap();
+    state.leader.clone()
 }
 
 // ==============================

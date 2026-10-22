@@ -80,9 +80,13 @@ async fn servers(State(state): State<SharedState>) -> Json<Value> {
     let server_states = get_server_states(state);
     let formatted: Vec<_> = server_states
         .into_iter()
-        .map(|(server, is_alive)| json!({"server_id":server, "is_alive":is_alive}))
+        .map(|server| json!({"server_id":server.server.id, "is_alive":server.is_alive}))
         .collect();
     Json(json!({"servers":formatted}))
+}
+async fn leader(State(state): State<SharedState>) -> Json<Value> {
+    let leader = stateops::get_leader(state);
+    Json(json!({"leader":leader, "alive":true}))
 }
 
 #[derive(Deserialize)]
@@ -223,6 +227,7 @@ fn build_app(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/servers", get(servers))
+        .route("/leader", get(leader))
         .route("/users", post(post_user).get(get_users))
         .route("/channels", get(get_channels))
         .route("/channels/{channel}/members", post(join_chanel))
