@@ -29,6 +29,15 @@ pub struct Channel {
     messages: Vec<Message>,
     next_message_id: usize,
 }
+impl Channel {
+    pub fn new() -> Self {
+        Channel {
+            users: HashSet::new(),
+            messages: Vec::new(),
+            next_message_id: 0,
+        }
+    }
+}
 pub struct AppState {
     users: HashSet<String>,
     channels: HashMap<String, Channel>,
@@ -98,6 +107,18 @@ fn channel_exists(state: SharedState, channel_name: &str) -> bool {
     let state = state.lock().unwrap();
     state.channels.contains_key(channel_name)
 }
+pub fn create_channel(state: SharedState, channel_name: String) -> StateResult<()> {
+    if channel_exists(state.clone(), &channel_name) {
+        Err((
+            StatusCode::BAD_REQUEST,
+            "Channel already exists".to_string(),
+        ))
+    } else {
+        let mut state = state.lock().unwrap();
+        state.channels.insert(channel_name.clone(), Channel::new());
+        Ok(())
+    }
+}
 /// if the channel doesn't exist yet, it will be created
 pub fn join_channel(state: SharedState, username: String, channel_name: String) -> StateResult<()> {
     // validate that user exists
@@ -115,11 +136,7 @@ pub fn join_channel(state: SharedState, username: String, channel_name: String) 
     let channel = state
         .channels
         .entry(channel_name.clone())
-        .or_insert(Channel {
-            users: HashSet::new(),
-            messages: Vec::new(),
-            next_message_id: 0,
-        });
+        .or_insert(Channel::new());
     if channel.users.contains(&username) {
         // duplicate
         Err((

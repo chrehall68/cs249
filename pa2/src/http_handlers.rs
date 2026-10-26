@@ -1,6 +1,6 @@
-use crate::discord_stateops;
 use crate::discord_stateops::SharedState;
 use crate::server_middleware::{SharedSystemState, get_leader, get_server_states};
+use crate::{discord_stateops, distributed_stateops};
 use std::collections::HashMap;
 
 use axum::{
@@ -72,7 +72,7 @@ where
 }
 
 // ==================================================
-// HTTP endpoints
+// System-related endpoints
 // ==================================================
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
@@ -90,12 +90,15 @@ async fn leader(State(state): State<SharedSystemState>) -> Json<Value> {
     Json(json!({"leader":leader, "alive":true}))
 }
 
+// ==================================================
+// Discord endpoints
+// ==================================================
 #[derive(Deserialize)]
 struct PostUserRequest {
     username: String,
 }
 async fn post_user(
-    State(state): State<SharedState>,
+    State(state): State<SharedSystemState>,
     body: Result<Json<PostUserRequest>, JsonRejection>,
 ) -> Result<Json<Value>, HttpServerError> {
     let Ok(body) = body else {
@@ -105,8 +108,8 @@ async fn post_user(
         )
             .into());
     };
-    // forward to
-    let () = discord_stateops::create_user(state, body.username.clone())?;
+    // forward to correct owner, or if we're the owner, handle it
+    let () = distributed_stateops::create_user(state, body.username.clone()).await?;
     Ok(Json(json!({"username": body.username.clone()})))
 }
 // async fn get_users(State(state): State<SharedState>) -> Json<Value> {
@@ -230,6 +233,7 @@ fn build_app(state: SharedSystemState) -> Router {
         .route("/health", get(health))
         .route("/servers", get(servers))
         .route("/leader", get(leader))
+        .route("/users", post(post_user))
         // .route("/users", post(post_user).get(get_users))
         // .route("/channels", get(get_channels))
         // .route("/channels/{channel}/members", post(join_chanel))

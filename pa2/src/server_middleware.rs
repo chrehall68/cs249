@@ -1,4 +1,8 @@
+/// This module is a dumb middleware
+/// Higher functionality should be implemented on top of it
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,7 +21,11 @@ use crate::discord_stateops::SharedState;
 
 /// if the peer fails to respond to heartbeats, or explicitly sends a disconnect,
 /// then Value is None. Otherwise, the value will be a some
-type Callback = Box<dyn FnMut(Option<Value>) + Send>;
+pub type Callback = Box<dyn FnOnce(Option<Value>) + Send>;
+/// callback is called when we receive a message
+/// the returned Value should have a "type" field
+pub type ReceiveCallback =
+    Arc<dyn Fn(String, Value) -> Pin<Box<dyn Future<Output = Value> + Send>> + Send + Sync>;
 
 // things to send to the other peer
 // and if we get a response, then we might want to do something
@@ -62,6 +70,7 @@ pub struct SystemState {
     // server_id -> receiver
     // items should be taken from this
     receivers: HashMap<String, Receiver<MessageToSend>>,
+    on_receive: Option<ReceiveCallback>,
 }
 
 impl SystemState {
@@ -80,6 +89,7 @@ impl SystemState {
             server_states,
             on_failure: Arc::new(Notify::new()),
             receivers,
+            on_receive: None,
         }
     }
 }
@@ -113,9 +123,35 @@ fn get_sender(state: SharedSystemState, server: String) -> Sender<MessageToSend>
     let state = state.lock().unwrap();
     state.server_states.get(&server).unwrap().tx.clone()
 }
-fn get_id(state: SharedSystemState) -> String {
+pub fn get_id(state: SharedSystemState) -> String {
     let state = state.lock().unwrap();
     state.id.clone()
+}
+pub fn get_discord(state: SharedSystemState) -> SharedState {
+    let state = state.lock().unwrap();
+    state.discord.clone()
+}
+pub fn set_receive_callback(state: SharedSystemState, callback: ReceiveCallback) {
+    let mut state = state.lock().unwrap();
+    state.on_receive = Some(callback);
+}
+pub async fn send_request(
+    state: SharedSystemState,
+    server: String,
+    request_type: String,
+    mut message: Value,
+    callback: Option<Callback>,
+) {
+    let sender = get_sender(state.clone(), server);
+    message["type"] = json!(request_type);
+    sender
+        .send(MessageToSend {
+            message,
+            callback,
+            is_response: false,
+        })
+        .await
+        .unwrap();
 }
 
 // ==============================
@@ -192,6 +228,7 @@ async fn send_pings_task(state: SharedSystemState, peer_id: String) {
 }
 // message sending; there's a single one of these
 // to prevent write conflicts
+// will add a sequence number
 async fn send_message_task(
     mut socket: OwnedWriteHalf,
     state: SharedSystemState,
@@ -221,6 +258,8 @@ async fn send_message_task(
             }
             format!("{}\n", message.message)
         };
+
+        println!("Sending message to {peer_id}: {message_str}");
 
         match socket.write_all(&message_str.as_bytes()).await {
             Ok(_) => (),
@@ -350,7 +389,7 @@ async fn peer_task(mut socket: TcpStream, state: SharedSystemState, peer_id: Opt
             let mut state = state.lock().unwrap();
             let peer_state = state.server_states.get_mut(&peer_id).unwrap();
             let callback = peer_state.seq_to_callback.remove(&seq_num);
-            if let Some(mut callback) = callback {
+            if let Some(callback) = callback {
                 callback(Some(value));
             }
         } else {
@@ -369,6 +408,22 @@ async fn peer_task(mut socket: TcpStream, state: SharedSystemState, peer_id: Opt
                 let leader = value.get("leader").unwrap().as_str().unwrap().to_string();
                 println!("received leader announcement from {leader}");
                 set_leader(state.clone(), leader);
+            } else {
+                // higher level request
+                let callback = state.lock().unwrap().on_receive.clone();
+                let response = match callback {
+                    Some(callback) => Some(callback(request_type.to_owned(), value).await),
+                    None => None,
+                };
+                if let Some(response) = response {
+                    let _ = sender
+                        .send(MessageToSend {
+                            message: response,
+                            callback: None,
+                            is_response: true,
+                        })
+                        .await;
+                }
             }
         }
     }

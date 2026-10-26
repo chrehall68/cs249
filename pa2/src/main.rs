@@ -1,5 +1,6 @@
 mod config;
 mod discord_stateops;
+mod distributed_stateops;
 mod http_handlers;
 mod server_middleware;
 use clap::Parser;
@@ -11,6 +12,7 @@ use std::{
 
 use crate::{
     config::{get_config_for, read_config},
+    distributed_stateops::init_state,
     server_middleware::{SharedSystemState, SystemState},
 };
 
@@ -47,6 +49,7 @@ async fn main() {
         &config,
         cli.id.clone(),
     )));
+    init_state(state.clone());
     let t1 = http_handlers::create_task(
         state.clone(),
         server_config.host.clone(),
