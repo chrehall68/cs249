@@ -23,7 +23,6 @@ use crate::discord_stateops::SharedState;
 /// then Value is None. Otherwise, the value will be a some
 pub type Callback = Box<dyn FnOnce(Option<Value>) + Send>;
 /// callback is called when we receive a message
-/// the returned Value should have a "type" field
 pub type ReceiveCallback =
     Arc<dyn Fn(String, Value) -> Pin<Box<dyn Future<Output = Value> + Send>> + Send + Sync>;
 
@@ -160,7 +159,7 @@ pub async fn send_request(
 // heartbeating
 async fn send_pings_task(state: SharedSystemState, peer_id: String) {
     let id = get_id(state.clone());
-    let sender = get_sender(state.clone(), id.clone());
+    let sender = get_sender(state.clone(), peer_id.clone());
     let missed_heartbeats = Arc::new(AtomicUsize::new(0));
     let pending_heartbeats = Arc::new(Mutex::new(HashSet::new()));
     let mut key = 0;
@@ -359,10 +358,10 @@ async fn peer_task(mut socket: TcpStream, state: SharedSystemState, peer_id: Opt
         peer_id.clone(),
         receiver,
     ));
-    tokio::spawn(leader_announcement_task(state.clone(), id.clone()));
+    tokio::spawn(leader_announcement_task(state.clone(), peer_id.clone()));
 
     let on_failure = state.lock().unwrap().on_failure.clone();
-    let sender = get_sender(state.clone(), id.clone());
+    let sender = get_sender(state.clone(), peer_id.clone());
 
     loop {
         // then get response
@@ -382,10 +381,10 @@ async fn peer_task(mut socket: TcpStream, state: SharedSystemState, peer_id: Opt
         cur_line = String::from(rest);
 
         // then dispatch
+        let seq_num = value.get("sequence_number").unwrap().as_u64().unwrap();
+        let seq_num = seq_num as usize;
         if value.get("is_response").unwrap().as_bool().unwrap() {
             // it's a response
-            let seq_num = value.get("sequence_number").unwrap().as_u64().unwrap();
-            let seq_num = seq_num as usize;
             let mut state = state.lock().unwrap();
             let peer_state = state.server_states.get_mut(&peer_id).unwrap();
             let callback = peer_state.seq_to_callback.remove(&seq_num);
@@ -412,7 +411,13 @@ async fn peer_task(mut socket: TcpStream, state: SharedSystemState, peer_id: Opt
                 // higher level request
                 let callback = state.lock().unwrap().on_receive.clone();
                 let response = match callback {
-                    Some(callback) => Some(callback(request_type.to_owned(), value).await),
+                    Some(callback) => {
+                        let mut response_value =
+                            callback(request_type.to_owned(), value.clone()).await;
+                        response_value["sequence_number"] = json!(seq_num);
+                        response_value["request_type"] = json!(request_type);
+                        Some(response_value)
+                    }
                     None => None,
                 };
                 if let Some(response) = response {

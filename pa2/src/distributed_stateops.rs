@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use axum::http::StatusCode;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
@@ -17,6 +20,23 @@ struct LocationConfig {
     backup: ServerId,
 }
 
+/// wire format for a StateResult:
+/// {"ok": <value>} on success, {"error": {"code": <u16>, "message": <string>}} on failure
+fn state_result_to_value<T: Serialize>(result: StateResult<T>) -> Value {
+    match result {
+        Ok(v) => json!({"ok": v}),
+        Err((code, message)) => json!({"error": {"code": code.as_u16(), "message": message}}),
+    }
+}
+fn state_result_from_value<T: DeserializeOwned>(value: &Value) -> StateResult<T> {
+    if let Some(error) = value.get("error") {
+        let code = StatusCode::from_u16(error["code"].as_u64().unwrap() as u16).unwrap();
+        Err((code, error["message"].as_str().unwrap().to_string()))
+    } else {
+        Ok(serde_json::from_value(value["ok"].clone()).unwrap())
+    }
+}
+
 fn receive_callback(state: SharedSystemState) -> ReceiveCallback {
     Arc::new(move |request_type, request: Value| {
         let state = state.clone();
@@ -24,10 +44,14 @@ fn receive_callback(state: SharedSystemState) -> ReceiveCallback {
             if request_type == "user_exists" {
                 let username = request["username"].as_str().unwrap();
                 let exists = user_exists(state.clone(), username).await;
-                return json!({"user_exists": exists, "type": "user_exists"});
+                return json!({"user_exists": exists});
+            } else if request_type == "create_user" {
+                let username = request["username"].as_str().unwrap();
+                let result = create_user(state.clone(), username.to_string()).await;
+                return state_result_to_value(result);
             }
 
-            json!({"status": "ok"})
+            panic!("Unknown request type: {}", request_type);
         })
     })
 }
@@ -147,7 +171,7 @@ pub async fn create_user(state: SharedSystemState, username: String) -> StateRes
         let request_type = "create_user".to_string();
         let result = forward_request(state.clone(), request, request_type, config).await;
         if let Some(result) = result {
-            return Ok(());
+            return state_result_from_value(&result);
         }
         // retry
         Box::pin(create_user(state, username)).await
