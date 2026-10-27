@@ -91,7 +91,7 @@ async fn leader(State(state): State<SharedSystemState>) -> Json<Value> {
 }
 
 // ==================================================
-// Discord endpoints
+// User endpoints
 // ==================================================
 #[derive(Deserialize)]
 struct PostUserRequest {
@@ -120,41 +120,58 @@ async fn debug_get_users(State(state): State<SharedSystemState>) -> Json<Value> 
     let users = distributed_stateops::get_my_users(state).await;
     Json(json!({"users":users}))
 }
-// async fn get_channels(State(state): State<SharedState>) -> Json<Value> {
-//     let channels = discord_stateops::get_channels(state);
-//     Json(json!({"channels": channels}))
-// }
-// async fn join_chanel(
-//     State(state): State<SharedState>,
-//     existing_user: ExistingUser,
-//     Path(channel_name): Path<String>,
-// ) -> Result<Json<Value>, HttpServerError> {
-//     let () = discord_stateops::join_channel(
-//         state,
-//         existing_user.username.clone(),
-//         channel_name.clone(),
-//     )?;
-//     Ok(Json(
-//         json!({"username": existing_user.username, "channel": channel_name, "joined": true}),
-//     ))
-// }
-// async fn list_channel_users(
-//     State(state): State<SharedState>,
-//     Path(channel_name): Path<String>,
-// ) -> Result<impl IntoResponse, HttpServerError> {
-//     let users = discord_stateops::list_channel_users(state, channel_name.clone())?;
-//     Ok(Json(json!({"users": users, "channel": channel_name})))
-// }
 
-// async fn leave_channel(
-//     State(state): State<SharedState>,
-//     Path((channel_name, username)): Path<(String, String)>,
-// ) -> Result<impl IntoResponse, HttpServerError> {
-//     let () = discord_stateops::leave_channel(state, username.clone(), channel_name.clone())?;
-//     Ok(Json(
-//         json!({"channel": channel_name, "username": username, "left": true}),
-//     ))
-// }
+// ==================================================
+// Channel endpoints
+// ==================================================
+
+async fn debug_get_channels(State(state): State<SharedSystemState>) -> Json<Value> {
+    let channels = distributed_stateops::get_my_channels(state).await;
+    Json(json!({"channels": channels}))
+}
+async fn get_channels(State(state): State<SharedSystemState>) -> Json<Value> {
+    let channels = distributed_stateops::get_channels(state).await;
+    Json(json!({"channels": channels}))
+}
+async fn join_channel(
+    State(state): State<SharedSystemState>,
+    existing_user: ExistingUser,
+    Path(channel_name): Path<String>,
+) -> Result<Json<Value>, HttpServerError> {
+    let () = distributed_stateops::join_channel(
+        state,
+        existing_user.username.clone(),
+        channel_name.clone(),
+    )
+    .await?;
+    Ok(Json(
+        json!({"username": existing_user.username, "channel": channel_name, "joined": true}),
+    ))
+}
+async fn list_channel_users(
+    State(state): State<SharedSystemState>,
+    Path(channel_name): Path<String>,
+) -> Result<impl IntoResponse, HttpServerError> {
+    let users = distributed_stateops::list_channel_users(state, channel_name.clone()).await?;
+    Ok(Json(json!({"users": users, "channel": channel_name})))
+}
+async fn debug_list_channel_users(
+    State(state): State<SharedSystemState>,
+    Path(channel_name): Path<String>,
+) -> Result<impl IntoResponse, HttpServerError> {
+    let users = distributed_stateops::debug_list_channel_users(state, channel_name.clone()).await?;
+    Ok(Json(json!({"users": users, "channel": channel_name})))
+}
+async fn leave_channel(
+    State(state): State<SharedSystemState>,
+    Path((channel_name, username)): Path<(String, String)>,
+) -> Result<impl IntoResponse, HttpServerError> {
+    let () =
+        distributed_stateops::leave_channel(state, username.clone(), channel_name.clone()).await?;
+    Ok(Json(
+        json!({"channel": channel_name, "username": username, "left": true}),
+    ))
+}
 // #[derive(Deserialize)]
 // struct SendMessageBody {
 //     text: String,
@@ -239,13 +256,18 @@ fn build_app(state: SharedSystemState) -> Router {
         .route("/leader", get(leader))
         .route("/users", post(post_user).get(get_users))
         .route("/debug/users", get(debug_get_users))
-        // .route("/channels", get(get_channels))
-        // .route("/channels/{channel}/members", post(join_chanel))
-        // .route(
-        //     "/channels/{channel}/members/{username}",
-        //     delete(leave_channel),
-        // )
-        // .route("/channels/{channel}/users", get(list_channel_users))
+        .route("/channels", get(get_channels))
+        .route("/debug/channels", get(debug_get_channels))
+        .route("/channels/{channel}/members", post(join_channel))
+        .route(
+            "/channels/{channel}/members/{username}",
+            delete(leave_channel),
+        )
+        .route("/channels/{channel}/users", get(list_channel_users))
+        .route(
+            "/debug/channels/{channel}/users",
+            get(debug_list_channel_users),
+        )
         // .route(
         //     "/channels/{channel}/messages",
         //     post(send_message).get(get_messages),

@@ -1,12 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
 use axum::http::StatusCode;
 use serde::Serialize;
 
-use crate::config::{Config, Server};
+use crate::{
+    config::{Config, Server},
+    discord_stateops,
+};
 
 #[derive(Serialize, Clone)]
 pub struct Message {
@@ -119,10 +123,17 @@ pub fn create_channel(state: SharedState, channel_name: String) -> StateResult<(
         Ok(())
     }
 }
+pub type UserExistsFn =
+    Box<dyn FnOnce(String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 /// if the channel doesn't exist yet, it will be created
-pub fn join_channel(state: SharedState, username: String, channel_name: String) -> StateResult<()> {
-    // validate that user exists
-    if !user_exists(state.clone(), &username) {
+pub async fn join_channel(
+    state: SharedState,
+    username: String,
+    channel_name: String,
+    user_exists: UserExistsFn,
+) -> StateResult<()> {
+    // validate that user exists somewhere in the system
+    if !user_exists(username.clone()).await {
         return Err((StatusCode::BAD_REQUEST, "User does not exist".to_string()));
     }
     if !channel_name_is_valid(&channel_name) {
@@ -131,7 +142,12 @@ pub fn join_channel(state: SharedState, username: String, channel_name: String) 
             "Channel must start with #".to_owned(),
         ));
     }
-    // user exists, and channel is valid
+    // user exists somewhere in the system, and channel is valid
+    // therefore we may need to create the user locally
+    if !discord_stateops::user_exists(state.clone(), &username) {
+        discord_stateops::create_user(state.clone(), username.clone())
+            .expect("user shouldn't exist");
+    }
     let mut state = state.lock().unwrap();
     let channel = state
         .channels
@@ -168,10 +184,11 @@ pub fn list_channel_users(state: SharedState, channel_name: String) -> StateResu
     let channel = state.channels.get(&channel_name).unwrap();
     Ok(channel.users.iter().map(|k| k.clone()).collect::<Vec<_>>())
 }
-pub fn leave_channel(
+pub async fn leave_channel(
     state: SharedState,
     username: String,
     channel_name: String,
+    user_exists: UserExistsFn,
 ) -> StateResult<()> {
     if !channel_name_is_valid(&channel_name) {
         return Err((
@@ -183,7 +200,7 @@ pub fn leave_channel(
     if !channel_exists(state.clone(), &channel_name) {
         return Err((StatusCode::NOT_FOUND, "Channel does not exist".to_owned()));
     }
-    if !user_exists(state.clone(), &username) {
+    if !user_exists(username.clone()).await {
         return Err((StatusCode::NOT_FOUND, "User does not exist".to_owned()));
     }
     let mut state = state.lock().unwrap();
@@ -200,23 +217,6 @@ pub fn leave_channel(
     Ok(())
 }
 
-pub fn leave_all_channels(state: SharedState, username: String) {
-    if !user_exists(state.clone(), &username) {
-        return;
-    }
-    // since the user exists, then we can simply leave all channels
-    // we know that each should succeed because each channel should already exist
-    let channels = state
-        .lock()
-        .unwrap()
-        .user_channels
-        .get(&username)
-        .unwrap()
-        .clone(); // clone to avoid borrow
-    for channel in channels {
-        leave_channel(state.clone(), username.clone(), channel.clone()).unwrap();
-    }
-}
 // ==============================
 // Messages
 // ==============================
