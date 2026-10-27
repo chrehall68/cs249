@@ -1,11 +1,11 @@
 use std::{
     hash::{self, Hasher},
-    sync::Arc,
+    sync::{Arc, mpsc::channel},
 };
 
 use crate::{
     config::ServerId,
-    discord_stateops::{self, StateResult, UserExistsFn, create_channel},
+    discord_stateops::{self, Message, StateResult, UserExistsFn, create_channel},
     server_middleware::{
         ReceiveCallback, SharedSystemState, get_discord, get_id, get_server_state,
         get_server_states, send_request, set_receive_callback,
@@ -136,6 +136,24 @@ fn receive_callback(state: SharedSystemState) -> ReceiveCallback {
                 let result =
                     leave_channel(state, username.to_string(), channel_name.to_string()).await;
                 return state_result_to_value(result);
+            } else if request_type == "send_message" {
+                let username = request["username"].as_str().unwrap();
+                let channel_name = request["channel"].as_str().unwrap();
+                let text = request["text"].as_str().unwrap();
+                let result = send_message(
+                    state,
+                    channel_name.to_string(),
+                    username.to_string(),
+                    text.to_string(),
+                )
+                .await;
+                return state_result_to_value(result);
+            } else if request_type == "get_messages" {
+                let channel_name = request["channel"].as_str().unwrap();
+                let limit = request["limit"].as_u64().map(|x| x as usize);
+                let offset = request["offset"].as_u64().map(|x| x as usize);
+                let messages = get_messages(state, channel_name.to_string(), limit, offset).await;
+                return state_result_to_value(messages);
             } else if request_type == "replicate" {
                 let request = request["request"].clone();
                 let request_type = request["type"].as_str().unwrap();
@@ -170,6 +188,23 @@ fn receive_callback(state: SharedSystemState) -> ReceiveCallback {
                         get_discord(state),
                         username.to_owned(),
                         channel_name.to_owned(),
+                        user_exists,
+                    )
+                    .await;
+                    return state_result_to_value(result);
+                } else if request_type == "send_message" {
+                    let username = request["username"].as_str().unwrap();
+                    let channel_name = request["channel"].as_str().unwrap();
+                    let text = request["text"].as_str().unwrap();
+                    // if the original request succeeded, then the user exists somewhere in the system
+                    // so we don't need to check
+                    let user_exists: UserExistsFn =
+                        Box::new(move |_username: String| Box::pin(async move { true }));
+                    let result = discord_stateops::send_message(
+                        get_discord(state),
+                        channel_name.to_owned(),
+                        username.to_owned(),
+                        text.to_owned(),
                         user_exists,
                     )
                     .await;
@@ -518,5 +553,102 @@ pub async fn leave_channel(
         }
         // retry
         Box::pin(join_channel(state, username, channel_name)).await
+    }
+}
+
+// ==============================
+// Messages
+// ==============================
+
+pub async fn send_message(
+    state: SharedSystemState,
+    channel_name: String,
+    username: String,
+    text: String,
+) -> StateResult<String> {
+    let id = get_id(state.clone());
+    let config = channel_owner(&channel_name);
+    // either we are the primary server, or the primary server is down
+    // means we are the authoritative server
+    if config.primary == id
+        || (!get_server_state(state.clone(), &config.primary) && id == config.backup)
+    {
+        let user_exists: UserExistsFn = {
+            let state = state.clone();
+            Box::new(move |username: String| {
+                Box::pin(async move { user_exists(state, &username).await })
+            })
+        };
+        let message_id = discord_stateops::send_message(
+            get_discord(state.clone()),
+            channel_name.clone(),
+            username.clone(),
+            text.clone(),
+            user_exists,
+        )
+        .await?;
+        // and also replicate operation
+        if config.backup == id || !get_server_state(state.clone(), &config.backup) {
+            return Ok(message_id);
+        }
+        let message = json!({"username": username, "channel": channel_name, "text": text});
+        let forward_result = replicate_op(
+            state.clone(),
+            message,
+            "send_message".to_owned(),
+            config.backup,
+        )
+        .await
+        .unwrap();
+        state_result_from_value(&forward_result)
+    } else {
+        // send a request to whatever is up out of the two
+        let request = json!({"username": username, "channel": channel_name, "text": text});
+        let request_type = "send_message".to_string();
+        let result = forward_request(state.clone(), request, request_type, config).await;
+        if let Some(result) = result {
+            return state_result_from_value(&result);
+        }
+        // retry
+        Box::pin(send_message(state, channel_name, username, text)).await
+    }
+}
+pub async fn debug_get_messages(
+    state: SharedSystemState,
+    channel_name: String,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> StateResult<Vec<Message>> {
+    discord_stateops::get_messages(get_discord(state), channel_name, limit, offset)
+}
+pub async fn get_messages(
+    state: SharedSystemState,
+    channel_name: String,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> StateResult<Vec<Message>> {
+    let id = get_id(state.clone());
+    let config = channel_owner(&channel_name);
+    // either we are the primary server, or the primary server is down
+    // means we are the authoritative server
+    if config.primary == id
+        || (!get_server_state(state.clone(), &config.primary) && id == config.backup)
+    {
+        discord_stateops::get_messages(
+            get_discord(state.clone()),
+            channel_name.clone(),
+            limit.clone(),
+            offset.clone(),
+        )
+    } else {
+        // send a request to whatever is up out of the two
+        let request = json!({"channel": channel_name, "limit": limit, "offset": offset});
+        let request_type = "get_messages".to_string();
+        let result = forward_request(state.clone(), request, request_type, config).await;
+        if let Some(result) = result {
+            return state_result_from_value(&result);
+        }
+        // retry
+        Box::pin(get_messages(state, channel_name, limit, offset)).await
     }
 }
