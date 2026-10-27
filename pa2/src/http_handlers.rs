@@ -112,10 +112,14 @@ async fn post_user(
     let () = distributed_stateops::create_user(state, body.username.clone()).await?;
     Ok(Json(json!({"username": body.username.clone()})))
 }
-// async fn get_users(State(state): State<SharedState>) -> Json<Value> {
-//     let users = discord_stateops::get_users(state);
-//     Json(json!({"users":users}))
-// }
+async fn get_users(State(state): State<SharedSystemState>) -> Json<Value> {
+    let users = distributed_stateops::get_users(state).await;
+    Json(json!({"users":users}))
+}
+async fn debug_get_users(State(state): State<SharedSystemState>) -> Json<Value> {
+    let users = distributed_stateops::get_my_users(state).await;
+    Json(json!({"users":users}))
+}
 // async fn get_channels(State(state): State<SharedState>) -> Json<Value> {
 //     let channels = discord_stateops::get_channels(state);
 //     Json(json!({"channels": channels}))
@@ -233,8 +237,8 @@ fn build_app(state: SharedSystemState) -> Router {
         .route("/health", get(health))
         .route("/servers", get(servers))
         .route("/leader", get(leader))
-        .route("/users", post(post_user))
-        // .route("/users", post(post_user).get(get_users))
+        .route("/users", post(post_user).get(get_users))
+        .route("/debug/users", get(debug_get_users))
         // .route("/channels", get(get_channels))
         // .route("/channels/{channel}/members", post(join_chanel))
         // .route(

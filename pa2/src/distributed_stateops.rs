@@ -10,8 +10,8 @@ use crate::{
     config::ServerId,
     discord_stateops::{self, StateResult, create_channel},
     server_middleware::{
-        ReceiveCallback, SharedSystemState, get_discord, get_id, get_server_state, send_request,
-        set_receive_callback,
+        ReceiveCallback, SharedSystemState, get_discord, get_id, get_server_state,
+        get_server_states, send_request, set_receive_callback,
     },
 };
 
@@ -42,13 +42,31 @@ fn receive_callback(state: SharedSystemState) -> ReceiveCallback {
         let state = state.clone();
         Box::pin(async move {
             if request_type == "user_exists" {
+                // if forwarded here, don't need to look elsewhere
                 let username = request["username"].as_str().unwrap();
-                let exists = user_exists(state.clone(), username).await;
+                let exists = discord_stateops::user_exists(get_discord(state), username);
                 return json!({"user_exists": exists});
             } else if request_type == "create_user" {
                 let username = request["username"].as_str().unwrap();
-                let result = create_user(state.clone(), username.to_string()).await;
+                let result = create_user(state, username.to_string()).await;
                 return state_result_to_value(result);
+            } else if request_type == "get_users" {
+                // get users is a special case where we don't need to do any communication
+                // since get users caller will already call all servers
+                let users = discord_stateops::get_users(get_discord(state));
+                return state_result_to_value(Ok(users));
+            } else if request_type == "replicate" {
+                let request = request["request"].clone();
+                if request["type"].as_str().unwrap() == "create_user" {
+                    let username = request["username"].as_str().unwrap();
+                    let result =
+                        discord_stateops::create_user(get_discord(state), username.to_string());
+                    return state_result_to_value(result);
+                }
+                panic!(
+                    "Unknown replicate type: {}",
+                    request["type"].as_str().unwrap()
+                );
             }
 
             panic!("Unknown request type: {}", request_type);
@@ -100,6 +118,44 @@ fn user_owner(username: &str) -> LocationConfig {
     panic!("Invalid server ID");
 }
 
+async fn forward_request_to(
+    state: SharedSystemState,
+    request: Value,
+    request_type: String,
+    to: ServerId,
+) -> Option<Value> {
+    let id = get_id(state.clone());
+    assert!(id != to);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let callback = {
+        Box::new(move |result| {
+            tx.send(result).unwrap();
+        })
+    };
+    send_request(
+        state.clone(),
+        to,
+        request_type.clone(),
+        request.clone(),
+        Some(callback),
+    )
+    .await;
+    rx.await.unwrap()
+}
+/// request should contain any necessary parameters
+async fn replicate_op(
+    state: SharedSystemState,
+    mut request: Value,
+    request_type: String,
+    to: ServerId,
+) -> Option<Value> {
+    // nest the request before sending
+    request["type"] = request_type.into();
+    let request = json!({"request": request});
+
+    forward_request_to(state, request, "replicate".to_owned(), to).await
+}
+
 // if None is returned, then that means the
 // server is down. Trying again should succeed
 async fn forward_request(
@@ -110,28 +166,13 @@ async fn forward_request(
 ) -> Option<Value> {
     let id = get_id(state.clone());
     assert!(id != location_config.primary);
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let callback = {
-        Box::new(move |result| {
-            tx.send(result).unwrap();
-        })
-    };
-
     let location = if get_server_state(state.clone(), &location_config.primary) {
         // forward to primary since primary is alive
         location_config.primary.clone()
     } else {
         location_config.backup.clone()
     };
-    send_request(
-        state.clone(),
-        location,
-        request_type.clone(),
-        request.clone(),
-        Some(callback),
-    )
-    .await;
-    rx.await.unwrap()
+    forward_request_to(state, request, request_type, location).await
 }
 
 pub async fn user_exists(state: SharedSystemState, username: &str) -> bool {
@@ -164,7 +205,21 @@ pub async fn create_user(state: SharedSystemState, username: String) -> StateRes
     if config.primary == id
         || (!get_server_state(state.clone(), &config.primary) && id == config.backup)
     {
-        discord_stateops::create_user(get_discord(state), username)
+        let () = discord_stateops::create_user(get_discord(state.clone()), username.clone())?;
+        // and also replicate operation
+        if config.backup == id || !get_server_state(state.clone(), &config.backup) {
+            return Ok(());
+        }
+        let message = json!({"username": username});
+        let forward_result = replicate_op(
+            state.clone(),
+            message,
+            "create_user".to_owned(),
+            config.backup,
+        )
+        .await
+        .unwrap();
+        state_result_from_value(&forward_result)
     } else {
         // send a request to whatever is up out of the two
         let request = json!({"username": username});
@@ -176,4 +231,28 @@ pub async fn create_user(state: SharedSystemState, username: String) -> StateRes
         // retry
         Box::pin(create_user(state, username)).await
     }
+}
+pub async fn get_my_users(state: SharedSystemState) -> Vec<String> {
+    discord_stateops::get_users(get_discord(state))
+}
+pub async fn get_users(state: SharedSystemState) -> Vec<String> {
+    // and ask everyone else
+    let id = get_id(state.clone());
+    let other_servers = get_server_states(state.clone());
+
+    let mut all_users = get_my_users(state.clone()).await;
+    for (peer_id, is_alive) in other_servers {
+        if peer_id != id && is_alive {
+            let mut other_users = state_result_from_value(
+                &forward_request_to(state.clone(), json!({}), "get_users".to_owned(), peer_id)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            all_users.append(&mut other_users);
+        }
+    }
+    all_users.sort();
+    all_users.dedup();
+    all_users
 }

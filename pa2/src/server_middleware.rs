@@ -393,7 +393,7 @@ async fn peer_task(mut socket: TcpStream, state: SharedSystemState, peer_id: Opt
             }
         } else {
             // it's a request
-            let request_type = value.get("type").unwrap().as_str().unwrap();
+            let request_type = value.get("type").unwrap().as_str().unwrap().to_owned();
             if request_type == "PING" {
                 // respond with PONG
                 let _ = sender.send(
@@ -408,26 +408,33 @@ async fn peer_task(mut socket: TcpStream, state: SharedSystemState, peer_id: Opt
                 println!("received leader announcement from {leader}");
                 set_leader(state.clone(), leader);
             } else {
-                // higher level request
+                // higher level request; answer in separate thread
+                // to avoid deadlock
                 let callback = state.lock().unwrap().on_receive.clone();
-                let response = match callback {
-                    Some(callback) => {
-                        let mut response_value =
-                            callback(request_type.to_owned(), value.clone()).await;
-                        response_value["sequence_number"] = json!(seq_num);
-                        response_value["request_type"] = json!(request_type);
-                        Some(response_value)
-                    }
-                    None => None,
-                };
-                if let Some(response) = response {
-                    let _ = sender
-                        .send(MessageToSend {
-                            message: response,
-                            callback: None,
-                            is_response: true,
-                        })
-                        .await;
+                {
+                    let value = value.clone();
+                    let sender = sender.clone();
+                    tokio::spawn(async move {
+                        let response = match callback {
+                            Some(callback) => {
+                                let mut response_value =
+                                    callback(request_type.to_owned(), value.clone()).await;
+                                response_value["sequence_number"] = json!(seq_num);
+                                response_value["request_type"] = json!(request_type);
+                                Some(response_value)
+                            }
+                            None => None,
+                        };
+                        if let Some(response) = response {
+                            let _ = sender
+                                .send(MessageToSend {
+                                    message: response,
+                                    callback: None,
+                                    is_response: true,
+                                })
+                                .await;
+                        }
+                    });
                 }
             }
         }
