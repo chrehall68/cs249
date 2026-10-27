@@ -1,4 +1,8 @@
+/// This module is a dumb middleware
+/// Higher functionality should be implemented on top of it
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,13 +17,14 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use crate::config::Config;
-use crate::stateops::{
-    SharedState, get_server_state, get_server_states, set_leader, set_server_state,
-};
+use crate::discord_stateops::SharedState;
 
 /// if the peer fails to respond to heartbeats, or explicitly sends a disconnect,
 /// then Value is None. Otherwise, the value will be a some
-type Callback = Box<dyn FnMut(Option<Value>) + Send>;
+pub type Callback = Box<dyn FnOnce(Option<Value>) + Send>;
+/// callback is called when we receive a message
+pub type ReceiveCallback =
+    Arc<dyn Fn(String, Value) -> Pin<Box<dyn Future<Output = Value> + Send>> + Send + Sync>;
 
 // things to send to the other peer
 // and if we get a response, then we might want to do something
@@ -30,26 +35,131 @@ struct MessageToSend {
     is_response: bool,
 }
 struct PeerState {
+    tx: Sender<MessageToSend>,
+    peer_id: String,
     sequence_num: usize,
     seq_to_callback: HashMap<usize, Callback>,
+    is_alive: bool,
 }
 impl PeerState {
-    fn new() -> Self {
-        PeerState {
-            sequence_num: 0,
-            seq_to_callback: HashMap::new(),
+    fn new(id: String) -> (Self, Receiver<MessageToSend>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        (
+            PeerState {
+                tx,
+                peer_id: id,
+                sequence_num: 0,
+                seq_to_callback: HashMap::new(),
+                is_alive: true,
+            },
+            rx,
+        )
+    }
+}
+pub struct SystemState {
+    discord: SharedState,
+    /// id of this server
+    id: String,
+    /// id of the leader
+    leader: String,
+
+    // server_id -> (server, is_alive)
+    server_states: HashMap<String, PeerState>,
+    on_failure: Arc<Notify>,
+    // server_id -> receiver
+    // items should be taken from this
+    receivers: HashMap<String, Receiver<MessageToSend>>,
+    on_receive: Option<ReceiveCallback>,
+}
+
+impl SystemState {
+    pub fn new(app_state: SharedState, config: &Config, id: String) -> Self {
+        let mut server_states = HashMap::new();
+        let mut receivers = HashMap::new();
+        for server in config {
+            let (peer_state, rx) = PeerState::new(server.id.clone());
+            server_states.insert(server.id.clone(), peer_state);
+            receivers.insert(server.id.clone(), rx);
+        }
+        Self {
+            discord: app_state,
+            id,
+            leader: "C".to_owned(),
+            server_states,
+            on_failure: Arc::new(Notify::new()),
+            receivers,
+            on_receive: None,
         }
     }
 }
-type SharedPeerState = Arc<Mutex<PeerState>>;
+pub type SharedSystemState = Arc<Mutex<SystemState>>;
 
-async fn send_pings_task(
-    app_state: SharedState,
-    id: String,
-    peer_id: String,
-    sender: Sender<MessageToSend>,
-    fail_notify: Arc<Notify>,
+pub fn set_server_state(state: SharedSystemState, server: String, is_alive: bool) {
+    let mut state = state.lock().unwrap();
+    state.server_states.get_mut(&server).unwrap().is_alive = is_alive;
+}
+pub fn get_server_state(state: SharedSystemState, server: &String) -> bool {
+    let state = state.lock().unwrap();
+    state.server_states.get(server).unwrap().is_alive
+}
+pub fn get_server_states(state: SharedSystemState) -> Vec<(String, bool)> {
+    let state = state.lock().unwrap();
+    state
+        .server_states
+        .values()
+        .map(|server| (server.peer_id.clone(), server.is_alive))
+        .collect()
+}
+pub fn set_leader(state: SharedSystemState, leader: String) {
+    let mut state = state.lock().unwrap();
+    state.leader = leader;
+}
+pub fn get_leader(state: SharedSystemState) -> String {
+    let state = state.lock().unwrap();
+    state.leader.clone()
+}
+fn get_sender(state: SharedSystemState, server: String) -> Sender<MessageToSend> {
+    let state = state.lock().unwrap();
+    state.server_states.get(&server).unwrap().tx.clone()
+}
+pub fn get_id(state: SharedSystemState) -> String {
+    let state = state.lock().unwrap();
+    state.id.clone()
+}
+pub fn get_discord(state: SharedSystemState) -> SharedState {
+    let state = state.lock().unwrap();
+    state.discord.clone()
+}
+pub fn set_receive_callback(state: SharedSystemState, callback: ReceiveCallback) {
+    let mut state = state.lock().unwrap();
+    state.on_receive = Some(callback);
+}
+pub async fn send_request(
+    state: SharedSystemState,
+    server: String,
+    request_type: String,
+    mut message: Value,
+    callback: Option<Callback>,
 ) {
+    let sender = get_sender(state.clone(), server);
+    message["type"] = json!(request_type);
+    sender
+        .send(MessageToSend {
+            message,
+            callback,
+            is_response: false,
+        })
+        .await
+        .unwrap();
+}
+
+// ==============================
+// Background communication tasks
+// ==============================
+// heartbeating
+async fn send_pings_task(state: SharedSystemState, peer_id: String) {
+    let id = get_id(state.clone());
+    let sender = get_sender(state.clone(), peer_id.clone());
     let missed_heartbeats = Arc::new(AtomicUsize::new(0));
     let pending_heartbeats = Arc::new(Mutex::new(HashSet::new()));
     let mut key = 0;
@@ -66,7 +176,7 @@ async fn send_pings_task(
         {
             let pending_heartbeats = pending_heartbeats.clone();
             let missed_heartbeats = missed_heartbeats.clone();
-            let app_state = app_state.clone();
+            let app_state = state.clone();
             let peer_id = peer_id.clone();
             tokio::spawn(async move {
                 sleep(Duration::from_secs(2)).await;
@@ -97,7 +207,7 @@ async fn send_pings_task(
         };
 
         println!("Sending ping to {peer_id}");
-        let mut server_alive = get_server_state(app_state.clone(), &peer_id.clone());
+        let mut server_alive = get_server_state(state.clone(), &peer_id.clone());
         if server_alive {
             server_alive = sender
                 .send(MessageToSend {
@@ -110,18 +220,19 @@ async fn send_pings_task(
         }
         if !server_alive {
             println!("Peer {peer_id} is disconnected; stopping");
-            fail_notify.notify_waiters();
+            state.lock().unwrap().on_failure.notify_waiters();
             break;
         }
     }
 }
+// message sending; there's a single one of these
+// to prevent write conflicts
+// will add a sequence number
 async fn send_message_task(
     mut socket: OwnedWriteHalf,
-    app_state: SharedState,
+    state: SharedSystemState,
     peer_id: String,
-    peer_state: SharedPeerState,
     mut receiver: Receiver<MessageToSend>,
-    fail_notify: Arc<Notify>,
 ) {
     loop {
         let message_str = {
@@ -132,7 +243,8 @@ async fn send_message_task(
                     break;
                 }
             };
-            let mut peer_state = peer_state.lock().unwrap();
+            let mut state = state.lock().unwrap();
+            let peer_state = state.server_states.get_mut(&peer_id).unwrap();
             if !message.is_response {
                 // attach a sequence number
                 message.message["sequence_number"] = json!(peer_state.sequence_num + 1);
@@ -146,6 +258,8 @@ async fn send_message_task(
             format!("{}\n", message.message)
         };
 
+        println!("Sending message to {peer_id}: {message_str}");
+
         match socket.write_all(&message_str.as_bytes()).await {
             Ok(_) => (),
             Err(e) => {
@@ -155,17 +269,15 @@ async fn send_message_task(
             }
         }
     }
-    set_server_state(app_state.clone(), peer_id.clone(), false);
-    fail_notify.notify_waiters();
+    set_server_state(state.clone(), peer_id.clone(), false);
+    state.lock().unwrap().on_failure.notify_waiters();
 }
-
-async fn leader_announcement(
-    app_state: SharedState,
-    id: String,
-    fail_notify: Arc<Notify>,
-    sender: Sender<MessageToSend>,
-) {
+// announce self as leader if we're the leader
+async fn leader_announcement_task(state: SharedSystemState, peer_id: String) {
     // at start, send leader announcement if C
+    let id = get_leader(state.clone());
+    let sender = get_sender(state.clone(), peer_id);
+    let fail_notify = state.lock().unwrap().on_failure.clone();
     if id == "C" {
         sender
             .send(MessageToSend {
@@ -180,14 +292,14 @@ async fn leader_announcement(
         // on failure of a node, we might be the new leader
         // so we might want to send a leader announcement
         fail_notify.notified().await;
-        let mut server_states: Vec<_> = get_server_states(app_state.clone())
+        let mut server_states: Vec<_> = get_server_states(state.clone())
             .into_iter()
-            .filter(|server| server.is_alive)
+            .filter_map(|(server, is_alive)| if is_alive { Some(server) } else { None })
             .collect();
-        server_states.sort_by(|a, b| a.server.id.cmp(&b.server.id));
+        server_states.sort();
         server_states.reverse();
-        if server_states[0].server.id == id {
-            set_leader(app_state.clone(), id.clone());
+        if server_states[0] == id {
+            set_leader(state.clone(), id.clone());
             let _ = sender
                 .send(MessageToSend {
                     message: json!({"type":"LEADER_ANNOUNCEMENT", "leader":id.clone()}),
@@ -198,13 +310,9 @@ async fn leader_announcement(
         }
     }
 }
-async fn peer_task(
-    mut socket: TcpStream,
-    state: SharedState,
-    id: String,
-    peer_id: Option<String>,
-    fail_notify: Arc<Notify>,
-) {
+// the main task for each peer; also handles receiving messages
+async fn peer_task(mut socket: TcpStream, state: SharedSystemState, peer_id: Option<String>) {
+    let id = get_id(state.clone());
     let mut buf = [0; 1024];
     let mut cur_line = String::new();
 
@@ -235,32 +343,26 @@ async fn peer_task(
     println!("connected to peer {}", peer_id);
 
     // then now that we know who peer is, do regular connection management
-    let (sender, receiver) = tokio::sync::mpsc::channel(100);
-    let peer_state = Arc::new(Mutex::new(PeerState::new()));
     let (mut reader, writer) = socket.into_split();
+    let receiver = {
+        let cloned = state.clone();
+        let mut state = cloned.lock().unwrap();
+        state.receivers.remove(&peer_id).unwrap()
+    };
 
     // spawn background tasks
-    tokio::spawn(send_pings_task(
-        state.clone(),
-        id.clone(),
-        peer_id.clone(),
-        sender.clone(),
-        fail_notify.clone(),
-    ));
+    tokio::spawn(send_pings_task(state.clone(), peer_id.clone()));
     tokio::spawn(send_message_task(
         writer,
         state.clone(),
         peer_id.clone(),
-        peer_state.clone(),
         receiver,
-        fail_notify.clone(),
     ));
-    tokio::spawn(leader_announcement(
-        state.clone(),
-        id.clone(),
-        fail_notify.clone(),
-        sender.clone(),
-    ));
+    tokio::spawn(leader_announcement_task(state.clone(), peer_id.clone()));
+
+    let on_failure = state.lock().unwrap().on_failure.clone();
+    let sender = get_sender(state.clone(), peer_id.clone());
+
     loop {
         // then get response
         while !cur_line.contains("\n") {
@@ -268,7 +370,7 @@ async fn peer_task(
             if n == 0 {
                 // peer disconnected
                 set_server_state(state.clone(), peer_id.clone(), false);
-                fail_notify.notify_waiters();
+                on_failure.notify_waiters();
                 return;
             }
             cur_line.push_str(std::str::from_utf8(&buf[0..n]).unwrap());
@@ -279,17 +381,19 @@ async fn peer_task(
         cur_line = String::from(rest);
 
         // then dispatch
+        let seq_num = value.get("sequence_number").unwrap().as_u64().unwrap();
+        let seq_num = seq_num as usize;
         if value.get("is_response").unwrap().as_bool().unwrap() {
             // it's a response
-            let seq_num = value.get("sequence_number").unwrap().as_u64().unwrap();
-            let seq_num = seq_num as usize;
-            let callback = peer_state.lock().unwrap().seq_to_callback.remove(&seq_num);
-            if let Some(mut callback) = callback {
+            let mut state = state.lock().unwrap();
+            let peer_state = state.server_states.get_mut(&peer_id).unwrap();
+            let callback = peer_state.seq_to_callback.remove(&seq_num);
+            if let Some(callback) = callback {
                 callback(Some(value));
             }
         } else {
             // it's a request
-            let request_type = value.get("type").unwrap().as_str().unwrap();
+            let request_type = value.get("type").unwrap().as_str().unwrap().to_owned();
             if request_type == "PING" {
                 // respond with PONG
                 let _ = sender.send(
@@ -303,19 +407,49 @@ async fn peer_task(
                 let leader = value.get("leader").unwrap().as_str().unwrap().to_string();
                 println!("received leader announcement from {leader}");
                 set_leader(state.clone(), leader);
+            } else {
+                // higher level request; answer in separate thread
+                // to avoid deadlock
+                let callback = state.lock().unwrap().on_receive.clone();
+                {
+                    let value = value.clone();
+                    let sender = sender.clone();
+                    tokio::spawn(async move {
+                        let response = match callback {
+                            Some(callback) => {
+                                let mut response_value =
+                                    callback(request_type.to_owned(), value.clone()).await;
+                                response_value["sequence_number"] = json!(seq_num);
+                                response_value["request_type"] = json!(request_type);
+                                Some(response_value)
+                            }
+                            None => None,
+                        };
+                        if let Some(response) = response {
+                            let _ = sender
+                                .send(MessageToSend {
+                                    message: response,
+                                    callback: None,
+                                    is_response: true,
+                                })
+                                .await;
+                        }
+                    });
+                }
             }
         }
     }
 }
 
-pub async fn create_task(
-    state: SharedState,
+// main task
+pub async fn main_task(
+    state: SharedSystemState,
     config: Config,
+    id: String,
+    // technically, these 2 are redundant, but it makes our life easier
     host: String,
     port: u16,
-    id: String,
 ) -> JoinHandle<()> {
-    let fail_notify = Arc::new(Notify::new());
     // connect to all servers < my id (prevents us from launching multiple connections)
     for other_server in &config {
         if other_server.id < id {
@@ -326,9 +460,7 @@ pub async fn create_task(
             tokio::spawn(peer_task(
                 socket,
                 state.clone(),
-                id.clone(),
                 Some(other_server.id.clone()),
-                fail_notify.clone(),
             ));
         }
     }
@@ -344,13 +476,7 @@ pub async fn create_task(
             let (socket, _) = listener.accept().await.unwrap();
 
             println!("received connection");
-            tokio::spawn(peer_task(
-                socket,
-                state.clone(),
-                id.clone(),
-                None,
-                fail_notify.clone(),
-            ));
+            tokio::spawn(peer_task(socket, state.clone(), None));
         }
     })
 }

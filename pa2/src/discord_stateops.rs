@@ -4,7 +4,7 @@ use std::{
 };
 
 use axum::http::StatusCode;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::config::{Config, Server};
 
@@ -12,10 +12,11 @@ use crate::config::{Config, Server};
 pub struct Message {
     pub username: String,
     pub text: String,
-    pub message_id: usize,
+    /// Every message has a unique id of the form "{channel_name}-{numeric_message_id}"
+    pub message_id: String,
 }
 impl Message {
-    pub fn new(username: String, text: String, message_id: usize) -> Self {
+    pub fn new(username: String, text: String, message_id: String) -> Self {
         Self {
             username,
             text,
@@ -26,11 +27,16 @@ impl Message {
 pub struct Channel {
     users: HashSet<String>,
     messages: Vec<Message>,
+    next_message_id: usize,
 }
-#[derive(Clone)]
-pub struct ServerWithState {
-    pub server: Server,
-    pub is_alive: bool,
+impl Channel {
+    pub fn new() -> Self {
+        Channel {
+            users: HashSet::new(),
+            messages: Vec::new(),
+            next_message_id: 0,
+        }
+    }
 }
 pub struct AppState {
     users: HashSet<String>,
@@ -38,9 +44,6 @@ pub struct AppState {
     // username -> channels
     // if a user exists, then they will have an entry in this hashmap
     user_channels: HashMap<String, HashSet<String>>,
-    next_message_id: usize,
-    server_states: HashMap<String, ServerWithState>,
-    leader: String,
 }
 impl AppState {
     pub fn from(id: String, config: &Config) -> Self {
@@ -48,20 +51,6 @@ impl AppState {
             users: HashSet::new(),
             channels: HashMap::new(),
             user_channels: HashMap::new(),
-            next_message_id: 0,
-            server_states: config
-                .iter()
-                .map(|server| {
-                    (
-                        server.id.clone(),
-                        ServerWithState {
-                            server: server.clone(),
-                            is_alive: true,
-                        },
-                    )
-                })
-                .collect(),
-            leader: "C".to_owned(),
         }
     }
 }
@@ -76,30 +65,6 @@ pub type StateError = (StatusCode, String);
 /// on error, we have (error code, error message)
 /// on success, we have the value
 pub type StateResult<T> = Result<T, StateError>;
-
-// ==============================
-// Servers
-// ==============================
-pub fn set_server_state(state: SharedState, server: String, is_alive: bool) {
-    let mut state = state.lock().unwrap();
-    state.server_states.get_mut(&server).unwrap().is_alive = is_alive;
-}
-pub fn get_server_state(state: SharedState, server: &String) -> bool {
-    let state = state.lock().unwrap();
-    state.server_states.get(server).unwrap().is_alive
-}
-pub fn get_server_states(state: SharedState) -> Vec<ServerWithState> {
-    let state = state.lock().unwrap();
-    state.server_states.clone().into_values().collect()
-}
-pub fn set_leader(state: SharedState, leader: String) {
-    let mut state = state.lock().unwrap();
-    state.leader = leader;
-}
-pub fn get_leader(state: SharedState) -> String {
-    let state = state.lock().unwrap();
-    state.leader.clone()
-}
 
 // ==============================
 // Users
@@ -142,6 +107,18 @@ fn channel_exists(state: SharedState, channel_name: &str) -> bool {
     let state = state.lock().unwrap();
     state.channels.contains_key(channel_name)
 }
+pub fn create_channel(state: SharedState, channel_name: String) -> StateResult<()> {
+    if channel_exists(state.clone(), &channel_name) {
+        Err((
+            StatusCode::BAD_REQUEST,
+            "Channel already exists".to_string(),
+        ))
+    } else {
+        let mut state = state.lock().unwrap();
+        state.channels.insert(channel_name.clone(), Channel::new());
+        Ok(())
+    }
+}
 /// if the channel doesn't exist yet, it will be created
 pub fn join_channel(state: SharedState, username: String, channel_name: String) -> StateResult<()> {
     // validate that user exists
@@ -159,10 +136,7 @@ pub fn join_channel(state: SharedState, username: String, channel_name: String) 
     let channel = state
         .channels
         .entry(channel_name.clone())
-        .or_insert(Channel {
-            users: HashSet::new(),
-            messages: Vec::new(),
-        });
+        .or_insert(Channel::new());
     if channel.users.contains(&username) {
         // duplicate
         Err((
@@ -251,7 +225,7 @@ pub fn send_message(
     channel_name: String,
     username: String,
     text: String,
-) -> StateResult<usize> {
+) -> StateResult<String> {
     if !channel_name_is_valid(&channel_name) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -267,15 +241,16 @@ pub fn send_message(
     }
 
     let mut state = state.lock().unwrap();
-    let channel = state.channels.get(&channel_name).unwrap();
+    let channel = state.channels.get_mut(&channel_name).unwrap();
     if !channel.users.contains(&username) {
         return Err((StatusCode::BAD_REQUEST, "User not in channel".to_owned()));
     }
-    let message_id = state.next_message_id;
-    state.next_message_id += 1;
+    let message_id = channel.next_message_id;
+    let message_id = format!("{}-{}", channel_name, message_id);
+    channel.next_message_id += 1;
     // get channel mutably now
     let channel = state.channels.get_mut(&channel_name).unwrap();
-    let message = Message::new(username, text, message_id);
+    let message = Message::new(username, text, message_id.clone());
     channel.messages.push(message);
     Ok(message_id)
 }
