@@ -123,14 +123,14 @@ pub fn create_channel(state: SharedState, channel_name: String) -> StateResult<(
         Ok(())
     }
 }
+pub type UserExistsFn =
+    Box<dyn FnOnce(String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 /// if the channel doesn't exist yet, it will be created
 pub async fn join_channel(
     state: SharedState,
     username: String,
     channel_name: String,
-    user_exists: Box<
-        dyn FnOnce(String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync,
-    >,
+    user_exists: UserExistsFn,
 ) -> StateResult<()> {
     // validate that user exists somewhere in the system
     if !user_exists(username.clone()).await {

@@ -1,12 +1,11 @@
 use std::{
     hash::{self, Hasher},
-    pin::Pin,
-    sync::{Arc, mpsc::channel},
+    sync::Arc,
 };
 
 use crate::{
     config::ServerId,
-    discord_stateops::{self, StateResult, create_channel},
+    discord_stateops::{self, StateResult, UserExistsFn, create_channel},
     server_middleware::{
         ReceiveCallback, SharedSystemState, get_discord, get_id, get_server_state,
         get_server_states, send_request, set_receive_callback,
@@ -127,12 +126,32 @@ fn receive_callback(state: SharedSystemState) -> ReceiveCallback {
                 let result =
                     join_channel(state, username.to_string(), channel_name.to_string()).await;
                 return state_result_to_value(result);
+            } else if request_type == "list_channel_users" {
+                let channel_name = request["channel"].as_str().unwrap();
+                let users = list_channel_users(state, channel_name.to_string()).await;
+                return state_result_to_value(users);
             } else if request_type == "replicate" {
                 let request = request["request"].clone();
-                if request["type"].as_str().unwrap() == "create_user" {
+                let request_type = request["type"].as_str().unwrap();
+                if request_type == "create_user" {
                     let username = request["username"].as_str().unwrap();
                     let result =
                         discord_stateops::create_user(get_discord(state), username.to_string());
+                    return state_result_to_value(result);
+                } else if request_type == "join_channel" {
+                    let username = request["username"].as_str().unwrap();
+                    let channel_name = request["channel"].as_str().unwrap();
+                    // if the original request succeeded, then the user exists somewhere in the system
+                    // so we don't need to check
+                    let user_exists: UserExistsFn =
+                        Box::new(move |_username: String| Box::pin(async move { true }));
+                    let result = discord_stateops::join_channel(
+                        get_discord(state),
+                        username.to_owned(),
+                        channel_name.to_owned(),
+                        user_exists,
+                    )
+                    .await;
                     return state_result_to_value(result);
                 }
                 panic!(
@@ -347,6 +366,36 @@ pub async fn get_channels(state: SharedSystemState) -> Vec<String> {
     all_channels.dedup();
     all_channels
 }
+pub async fn debug_list_channel_users(
+    state: SharedSystemState,
+    channel_name: String,
+) -> StateResult<Vec<String>> {
+    discord_stateops::list_channel_users(get_discord(state), channel_name)
+}
+pub async fn list_channel_users(
+    state: SharedSystemState,
+    channel_name: String,
+) -> StateResult<Vec<String>> {
+    let id = get_id(state.clone());
+    let config = channel_owner(&channel_name);
+    // either we are the primary server, or the primary server is down
+    // means we are the authoritative server
+    if config.primary == id
+        || (!get_server_state(state.clone(), &config.primary) && id == config.backup)
+    {
+        discord_stateops::list_channel_users(get_discord(state), channel_name)
+    } else {
+        // send a request to whatever is up out of the two
+        let request = json!({"channel": channel_name});
+        let request_type = "list_channel_users".to_string();
+        let result = forward_request(state.clone(), request, request_type, config).await;
+        if let Some(result) = result {
+            return state_result_from_value(&result);
+        }
+        // retry
+        Box::pin(list_channel_users(state, channel_name)).await
+    }
+}
 pub async fn join_channel(
     state: SharedSystemState,
     username: String,
@@ -359,17 +408,33 @@ pub async fn join_channel(
     if config.primary == id
         || (!get_server_state(state.clone(), &config.primary) && id == config.backup)
     {
-        let user_exists: Box<
-            dyn FnOnce(String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync,
-        > = {
+        let user_exists: UserExistsFn = {
             let state = state.clone();
             Box::new(move |username: String| {
                 Box::pin(async move { user_exists(state, &username).await })
             })
         };
-        discord_stateops::join_channel(get_discord(state), username, channel_name, user_exists)
-            .await
-        // TODO - replicate result too
+        let () = discord_stateops::join_channel(
+            get_discord(state.clone()),
+            username.clone(),
+            channel_name.clone(),
+            user_exists,
+        )
+        .await?;
+        // and also replicate operation
+        if config.backup == id || !get_server_state(state.clone(), &config.backup) {
+            return Ok(());
+        }
+        let message = json!({"username": username, "channel": channel_name});
+        let forward_result = replicate_op(
+            state.clone(),
+            message,
+            "join_channel".to_owned(),
+            config.backup,
+        )
+        .await
+        .unwrap();
+        state_result_from_value(&forward_result)
     } else {
         // send a request to whatever is up out of the two
         let request = json!({"username": username, "channel": channel_name});
