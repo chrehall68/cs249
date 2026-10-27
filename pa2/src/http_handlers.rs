@@ -162,15 +162,16 @@ async fn debug_list_channel_users(
     let users = distributed_stateops::debug_list_channel_users(state, channel_name.clone()).await?;
     Ok(Json(json!({"users": users, "channel": channel_name})))
 }
-// async fn leave_channel(
-//     State(state): State<SharedState>,
-//     Path((channel_name, username)): Path<(String, String)>,
-// ) -> Result<impl IntoResponse, HttpServerError> {
-//     let () = discord_stateops::leave_channel(state, username.clone(), channel_name.clone())?;
-//     Ok(Json(
-//         json!({"channel": channel_name, "username": username, "left": true}),
-//     ))
-// }
+async fn leave_channel(
+    State(state): State<SharedSystemState>,
+    Path((channel_name, username)): Path<(String, String)>,
+) -> Result<impl IntoResponse, HttpServerError> {
+    let () =
+        distributed_stateops::leave_channel(state, username.clone(), channel_name.clone()).await?;
+    Ok(Json(
+        json!({"channel": channel_name, "username": username, "left": true}),
+    ))
+}
 // #[derive(Deserialize)]
 // struct SendMessageBody {
 //     text: String,
@@ -258,10 +259,10 @@ fn build_app(state: SharedSystemState) -> Router {
         .route("/channels", get(get_channels))
         .route("/debug/channels", get(debug_get_channels))
         .route("/channels/{channel}/members", post(join_channel))
-        // .route(
-        //     "/channels/{channel}/members/{username}",
-        //     delete(leave_channel),
-        // )
+        .route(
+            "/channels/{channel}/members/{username}",
+            delete(leave_channel),
+        )
         .route("/channels/{channel}/users", get(list_channel_users))
         .route(
             "/debug/channels/{channel}/users",
