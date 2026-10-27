@@ -91,7 +91,7 @@ async fn leader(State(state): State<SharedSystemState>) -> Json<Value> {
 }
 
 // ==================================================
-// Discord endpoints
+// User endpoints
 // ==================================================
 #[derive(Deserialize)]
 struct PostUserRequest {
@@ -120,10 +120,19 @@ async fn debug_get_users(State(state): State<SharedSystemState>) -> Json<Value> 
     let users = distributed_stateops::get_my_users(state).await;
     Json(json!({"users":users}))
 }
-// async fn get_channels(State(state): State<SharedState>) -> Json<Value> {
-//     let channels = discord_stateops::get_channels(state);
-//     Json(json!({"channels": channels}))
-// }
+
+// ==================================================
+// Channel endpoints
+// ==================================================
+
+async fn debug_get_channels(State(state): State<SharedSystemState>) -> Json<Value> {
+    let channels = distributed_stateops::get_my_channels(state).await;
+    Json(json!({"channels": channels}))
+}
+async fn get_channels(State(state): State<SharedSystemState>) -> Json<Value> {
+    let channels = distributed_stateops::get_channels(state).await;
+    Json(json!({"channels": channels}))
+}
 // async fn join_chanel(
 //     State(state): State<SharedState>,
 //     existing_user: ExistingUser,
@@ -239,7 +248,8 @@ fn build_app(state: SharedSystemState) -> Router {
         .route("/leader", get(leader))
         .route("/users", post(post_user).get(get_users))
         .route("/debug/users", get(debug_get_users))
-        // .route("/channels", get(get_channels))
+        .route("/channels", get(get_channels))
+        .route("/debug/channels", get(debug_get_channels))
         // .route("/channels/{channel}/members", post(join_chanel))
         // .route(
         //     "/channels/{channel}/members/{username}",

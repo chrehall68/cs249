@@ -1,11 +1,5 @@
 use std::sync::Arc;
 
-use axum::http::StatusCode;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
-use tokio::sync::Notify;
-
 use crate::{
     config::ServerId,
     discord_stateops::{self, StateResult, create_channel},
@@ -14,11 +8,19 @@ use crate::{
         get_server_states, send_request, set_receive_callback,
     },
 };
+use axum::http::StatusCode;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
 
 struct LocationConfig {
     primary: ServerId,
     backup: ServerId,
 }
+
+// ==============================
+// Request Forwarding
+// ==============================
 
 /// wire format for a StateResult:
 /// {"ok": <value>} on success, {"error": {"code": <u16>, "message": <string>}} on failure
@@ -35,87 +37,6 @@ fn state_result_from_value<T: DeserializeOwned>(value: &Value) -> StateResult<T>
     } else {
         Ok(serde_json::from_value(value["ok"].clone()).unwrap())
     }
-}
-
-fn receive_callback(state: SharedSystemState) -> ReceiveCallback {
-    Arc::new(move |request_type, request: Value| {
-        let state = state.clone();
-        Box::pin(async move {
-            if request_type == "user_exists" {
-                // if forwarded here, don't need to look elsewhere
-                let username = request["username"].as_str().unwrap();
-                let exists = discord_stateops::user_exists(get_discord(state), username);
-                return json!({"user_exists": exists});
-            } else if request_type == "create_user" {
-                let username = request["username"].as_str().unwrap();
-                let result = create_user(state, username.to_string()).await;
-                return state_result_to_value(result);
-            } else if request_type == "get_users" {
-                // get users is a special case where we don't need to do any communication
-                // since get users caller will already call all servers
-                let users = discord_stateops::get_users(get_discord(state));
-                return state_result_to_value(Ok(users));
-            } else if request_type == "replicate" {
-                let request = request["request"].clone();
-                if request["type"].as_str().unwrap() == "create_user" {
-                    let username = request["username"].as_str().unwrap();
-                    let result =
-                        discord_stateops::create_user(get_discord(state), username.to_string());
-                    return state_result_to_value(result);
-                }
-                panic!(
-                    "Unknown replicate type: {}",
-                    request["type"].as_str().unwrap()
-                );
-            }
-
-            panic!("Unknown request type: {}", request_type);
-        })
-    })
-}
-
-pub fn init_state(state: SharedSystemState) {
-    // create channels that must exist on startup
-    let id = get_id(state.clone());
-    if id == "A" {
-        let _ = create_channel(get_discord(state.clone()), "#systems".to_string()).unwrap();
-        let _ = create_channel(get_discord(state.clone()), "#cs249".to_string()).unwrap();
-    } else if id == "B" {
-        let _ = create_channel(get_discord(state.clone()), "#cs249".to_string()).unwrap();
-        let _ = create_channel(get_discord(state.clone()), "#distributed".to_string()).unwrap();
-    } else if id == "C" {
-        let _ = create_channel(get_discord(state.clone()), "#distributed".to_string()).unwrap();
-        let _ = create_channel(get_discord(state.clone()), "#systems".to_string()).unwrap();
-    } else {
-        panic!("Invalid server ID");
-    }
-
-    // and register our hook
-    set_receive_callback(state.clone(), receive_callback(state));
-}
-
-fn user_owner(username: &str) -> LocationConfig {
-    // partition users by first letter
-    assert!(username.len() >= 1);
-    let first_char = username.chars().next().unwrap();
-    let first_char_mod = (first_char as u8) % 3;
-    if first_char_mod == 0 {
-        return LocationConfig {
-            primary: "A".to_string(),
-            backup: "B".to_string(),
-        };
-    } else if first_char_mod == 1 {
-        return LocationConfig {
-            primary: "B".to_string(),
-            backup: "C".to_string(),
-        };
-    } else if first_char_mod == 2 {
-        return LocationConfig {
-            primary: "C".to_string(),
-            backup: "A".to_string(),
-        };
-    }
-    panic!("Invalid server ID");
 }
 
 async fn forward_request_to(
@@ -173,6 +94,94 @@ async fn forward_request(
         location_config.backup.clone()
     };
     forward_request_to(state, request, request_type, location).await
+}
+
+fn receive_callback(state: SharedSystemState) -> ReceiveCallback {
+    Arc::new(move |request_type, request: Value| {
+        let state = state.clone();
+        Box::pin(async move {
+            if request_type == "user_exists" {
+                // if forwarded here, don't need to look elsewhere
+                let username = request["username"].as_str().unwrap();
+                let exists = discord_stateops::user_exists(get_discord(state), username);
+                return json!({"user_exists": exists});
+            } else if request_type == "create_user" {
+                let username = request["username"].as_str().unwrap();
+                let result = create_user(state, username.to_string()).await;
+                return state_result_to_value(result);
+            } else if request_type == "get_users" {
+                // get users is a special case where we don't need to do any communication
+                // since get users caller will already call all servers
+                let users = discord_stateops::get_users(get_discord(state));
+                return state_result_to_value(Ok(users));
+            } else if request_type == "get_channels" {
+                let channels = discord_stateops::get_channels(get_discord(state));
+                return state_result_to_value(Ok(channels));
+            } else if request_type == "replicate" {
+                let request = request["request"].clone();
+                if request["type"].as_str().unwrap() == "create_user" {
+                    let username = request["username"].as_str().unwrap();
+                    let result =
+                        discord_stateops::create_user(get_discord(state), username.to_string());
+                    return state_result_to_value(result);
+                }
+                panic!(
+                    "Unknown replicate type: {}",
+                    request["type"].as_str().unwrap()
+                );
+            }
+
+            panic!("Unknown request type: {}", request_type);
+        })
+    })
+}
+
+pub fn init_state(state: SharedSystemState) {
+    // create channels that must exist on startup
+    let id = get_id(state.clone());
+    if id == "A" {
+        let _ = create_channel(get_discord(state.clone()), "#systems".to_string()).unwrap();
+        let _ = create_channel(get_discord(state.clone()), "#cs249".to_string()).unwrap();
+    } else if id == "B" {
+        let _ = create_channel(get_discord(state.clone()), "#cs249".to_string()).unwrap();
+        let _ = create_channel(get_discord(state.clone()), "#distributed".to_string()).unwrap();
+    } else if id == "C" {
+        let _ = create_channel(get_discord(state.clone()), "#distributed".to_string()).unwrap();
+        let _ = create_channel(get_discord(state.clone()), "#systems".to_string()).unwrap();
+    } else {
+        panic!("Invalid server ID");
+    }
+
+    // and register our hook
+    set_receive_callback(state.clone(), receive_callback(state));
+}
+
+// ==============================
+// Users
+// ==============================
+
+fn user_owner(username: &str) -> LocationConfig {
+    // partition users by first letter
+    assert!(username.len() >= 1);
+    let first_char = username.chars().next().unwrap();
+    let first_char_mod = (first_char as u8) % 3;
+    if first_char_mod == 0 {
+        return LocationConfig {
+            primary: "A".to_string(),
+            backup: "B".to_string(),
+        };
+    } else if first_char_mod == 1 {
+        return LocationConfig {
+            primary: "B".to_string(),
+            backup: "C".to_string(),
+        };
+    } else if first_char_mod == 2 {
+        return LocationConfig {
+            primary: "C".to_string(),
+            backup: "A".to_string(),
+        };
+    }
+    panic!("Invalid server ID");
 }
 
 pub async fn user_exists(state: SharedSystemState, username: &str) -> bool {
@@ -255,4 +264,33 @@ pub async fn get_users(state: SharedSystemState) -> Vec<String> {
     all_users.sort();
     all_users.dedup();
     all_users
+}
+
+// ==============================
+// Channels
+// ==============================
+
+pub async fn get_my_channels(state: SharedSystemState) -> Vec<String> {
+    discord_stateops::get_channels(get_discord(state))
+}
+pub async fn get_channels(state: SharedSystemState) -> Vec<String> {
+    // and ask everyone else
+    let id = get_id(state.clone());
+    let other_servers = get_server_states(state.clone());
+
+    let mut all_channels = get_my_channels(state.clone()).await;
+    for (peer_id, is_alive) in other_servers {
+        if peer_id != id && is_alive {
+            let mut other_users = state_result_from_value(
+                &forward_request_to(state.clone(), json!({}), "get_channels".to_owned(), peer_id)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            all_channels.append(&mut other_users);
+        }
+    }
+    all_channels.sort();
+    all_channels.dedup();
+    all_channels
 }
