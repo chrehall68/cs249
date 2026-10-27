@@ -1,12 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
 use axum::http::StatusCode;
 use serde::Serialize;
 
-use crate::config::{Config, Server};
+use crate::{
+    config::{Config, Server},
+    discord_stateops,
+};
 
 #[derive(Serialize, Clone)]
 pub struct Message {
@@ -120,9 +124,16 @@ pub fn create_channel(state: SharedState, channel_name: String) -> StateResult<(
     }
 }
 /// if the channel doesn't exist yet, it will be created
-pub fn join_channel(state: SharedState, username: String, channel_name: String) -> StateResult<()> {
-    // validate that user exists
-    if !user_exists(state.clone(), &username) {
+pub async fn join_channel(
+    state: SharedState,
+    username: String,
+    channel_name: String,
+    user_exists: Box<
+        dyn FnOnce(String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync,
+    >,
+) -> StateResult<()> {
+    // validate that user exists somewhere in the system
+    if !user_exists(username.clone()).await {
         return Err((StatusCode::BAD_REQUEST, "User does not exist".to_string()));
     }
     if !channel_name_is_valid(&channel_name) {
@@ -131,7 +142,12 @@ pub fn join_channel(state: SharedState, username: String, channel_name: String) 
             "Channel must start with #".to_owned(),
         ));
     }
-    // user exists, and channel is valid
+    // user exists somewhere in the system, and channel is valid
+    // therefore we may need to create the user locally
+    if !discord_stateops::user_exists(state.clone(), &username) {
+        discord_stateops::create_user(state.clone(), username.clone())
+            .expect("user shouldn't exist");
+    }
     let mut state = state.lock().unwrap();
     let channel = state
         .channels

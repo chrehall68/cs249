@@ -133,20 +133,21 @@ async fn get_channels(State(state): State<SharedSystemState>) -> Json<Value> {
     let channels = distributed_stateops::get_channels(state).await;
     Json(json!({"channels": channels}))
 }
-// async fn join_chanel(
-//     State(state): State<SharedState>,
-//     existing_user: ExistingUser,
-//     Path(channel_name): Path<String>,
-// ) -> Result<Json<Value>, HttpServerError> {
-//     let () = discord_stateops::join_channel(
-//         state,
-//         existing_user.username.clone(),
-//         channel_name.clone(),
-//     )?;
-//     Ok(Json(
-//         json!({"username": existing_user.username, "channel": channel_name, "joined": true}),
-//     ))
-// }
+async fn join_channel(
+    State(state): State<SharedSystemState>,
+    existing_user: ExistingUser,
+    Path(channel_name): Path<String>,
+) -> Result<Json<Value>, HttpServerError> {
+    let () = distributed_stateops::join_channel(
+        state,
+        existing_user.username.clone(),
+        channel_name.clone(),
+    )
+    .await?;
+    Ok(Json(
+        json!({"username": existing_user.username, "channel": channel_name, "joined": true}),
+    ))
+}
 // async fn list_channel_users(
 //     State(state): State<SharedState>,
 //     Path(channel_name): Path<String>,
@@ -250,7 +251,7 @@ fn build_app(state: SharedSystemState) -> Router {
         .route("/debug/users", get(debug_get_users))
         .route("/channels", get(get_channels))
         .route("/debug/channels", get(debug_get_channels))
-        // .route("/channels/{channel}/members", post(join_chanel))
+        .route("/channels/{channel}/members", post(join_channel))
         // .route(
         //     "/channels/{channel}/members/{username}",
         //     delete(leave_channel),

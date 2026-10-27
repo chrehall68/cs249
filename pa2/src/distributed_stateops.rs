@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    hash::{self, Hasher},
+    pin::Pin,
+    sync::{Arc, mpsc::channel},
+};
 
 use crate::{
     config::ServerId,
@@ -117,6 +121,12 @@ fn receive_callback(state: SharedSystemState) -> ReceiveCallback {
             } else if request_type == "get_channels" {
                 let channels = discord_stateops::get_channels(get_discord(state));
                 return state_result_to_value(Ok(channels));
+            } else if request_type == "join_channel" {
+                let username = request["username"].as_str().unwrap();
+                let channel_name = request["channel"].as_str().unwrap();
+                let result =
+                    join_channel(state, username.to_string(), channel_name.to_string()).await;
+                return state_result_to_value(result);
             } else if request_type == "replicate" {
                 let request = request["request"].clone();
                 if request["type"].as_str().unwrap() == "create_user" {
@@ -269,6 +279,49 @@ pub async fn get_users(state: SharedSystemState) -> Vec<String> {
 // ==============================
 // Channels
 // ==============================
+fn channel_owner(channel_name: &str) -> LocationConfig {
+    // partition channels by first letter
+    if channel_name == "#cs249" {
+        return LocationConfig {
+            primary: "A".to_string(),
+            backup: "B".to_string(),
+        };
+    } else if channel_name == "#distributed" {
+        return LocationConfig {
+            primary: "B".to_string(),
+            backup: "C".to_string(),
+        };
+    } else if channel_name == "#systems" {
+        return LocationConfig {
+            primary: "C".to_string(),
+            backup: "A".to_string(),
+        };
+    }
+
+    // if it's not a special channel, hash it
+    let mut h = hash::DefaultHasher::new();
+    h.write(channel_name.as_bytes());
+    let h = h.finish();
+
+    let hash_mod = h % 3;
+    if hash_mod == 0 {
+        return LocationConfig {
+            primary: "A".to_string(),
+            backup: "B".to_string(),
+        };
+    } else if hash_mod == 1 {
+        return LocationConfig {
+            primary: "B".to_string(),
+            backup: "C".to_string(),
+        };
+    } else if hash_mod == 2 {
+        return LocationConfig {
+            primary: "C".to_string(),
+            backup: "A".to_string(),
+        };
+    }
+    panic!("Invalid channel name");
+}
 
 pub async fn get_my_channels(state: SharedSystemState) -> Vec<String> {
     discord_stateops::get_channels(get_discord(state))
@@ -293,4 +346,39 @@ pub async fn get_channels(state: SharedSystemState) -> Vec<String> {
     all_channels.sort();
     all_channels.dedup();
     all_channels
+}
+pub async fn join_channel(
+    state: SharedSystemState,
+    username: String,
+    channel_name: String,
+) -> StateResult<()> {
+    let id = get_id(state.clone());
+    let config = channel_owner(&channel_name);
+    // either we are the primary server, or the primary server is down
+    // means we are the authoritative server
+    if config.primary == id
+        || (!get_server_state(state.clone(), &config.primary) && id == config.backup)
+    {
+        let user_exists: Box<
+            dyn FnOnce(String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync,
+        > = {
+            let state = state.clone();
+            Box::new(move |username: String| {
+                Box::pin(async move { user_exists(state, &username).await })
+            })
+        };
+        discord_stateops::join_channel(get_discord(state), username, channel_name, user_exists)
+            .await
+        // TODO - replicate result too
+    } else {
+        // send a request to whatever is up out of the two
+        let request = json!({"username": username, "channel": channel_name});
+        let request_type = "join_channel".to_string();
+        let result = forward_request(state.clone(), request, request_type, config).await;
+        if let Some(result) = result {
+            return state_result_from_value(&result);
+        }
+        // retry
+        Box::pin(join_channel(state, username, channel_name)).await
+    }
 }
