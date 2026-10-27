@@ -172,33 +172,34 @@ async fn leave_channel(
         json!({"channel": channel_name, "username": username, "left": true}),
     ))
 }
-// #[derive(Deserialize)]
-// struct SendMessageBody {
-//     text: String,
-// }
-// async fn send_message(
-//     State(state): State<SharedState>,
-//     existing_user: ExistingUser,
-//     Path(channel_name): Path<String>,
-//     body: Result<Json<SendMessageBody>, JsonRejection>,
-// ) -> Result<impl IntoResponse, HttpServerError> {
-//     let Ok(body) = body else {
-//         return Err((
-//             StatusCode::BAD_REQUEST,
-//             "Invalid request body; must be valid json with a text field".to_string(),
-//         )
-//             .into());
-//     };
-//     let message_id = discord_stateops::send_message(
-//         state,
-//         channel_name.clone(),
-//         existing_user.username.clone(),
-//         body.text.clone(),
-//     )?;
-//     Ok(Json(
-//         json!({"channel": channel_name, "message_id": message_id, "username": existing_user.username, "text": body.text}),
-//     ))
-// }
+#[derive(Deserialize)]
+struct SendMessageBody {
+    text: String,
+}
+async fn send_message(
+    State(state): State<SharedSystemState>,
+    existing_user: ExistingUser,
+    Path(channel_name): Path<String>,
+    body: Result<Json<SendMessageBody>, JsonRejection>,
+) -> Result<impl IntoResponse, HttpServerError> {
+    let Ok(body) = body else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid request body; must be valid json with a text field".to_string(),
+        )
+            .into());
+    };
+    let message_id = distributed_stateops::send_message(
+        state,
+        channel_name.clone(),
+        existing_user.username.clone(),
+        body.text.clone(),
+    )
+    .await?;
+    Ok(Json(
+        json!({"channel": channel_name, "message_id": message_id, "username": existing_user.username, "text": body.text}),
+    ))
+}
 // async fn get_messages(
 //     State(state): State<SharedState>,
 //     Path(channel_name): Path<String>,
@@ -268,6 +269,7 @@ fn build_app(state: SharedSystemState) -> Router {
             "/debug/channels/{channel}/users",
             get(debug_list_channel_users),
         )
+        .route("/channels/{channel}/messages", post(send_message))
         // .route(
         //     "/channels/{channel}/messages",
         //     post(send_message).get(get_messages),

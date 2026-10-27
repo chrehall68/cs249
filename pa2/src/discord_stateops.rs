@@ -45,16 +45,12 @@ impl Channel {
 pub struct AppState {
     users: HashSet<String>,
     channels: HashMap<String, Channel>,
-    // username -> channels
-    // if a user exists, then they will have an entry in this hashmap
-    user_channels: HashMap<String, HashSet<String>>,
 }
 impl AppState {
     pub fn from(id: String, config: &Config) -> Self {
         Self {
             users: HashSet::new(),
             channels: HashMap::new(),
-            user_channels: HashMap::new(),
         }
     }
 }
@@ -88,7 +84,6 @@ pub fn create_user(state: SharedState, username: String) -> StateResult<()> {
     } else {
         let mut state = state.lock().unwrap();
         state.users.insert(username.clone());
-        state.user_channels.insert(username.clone(), HashSet::new());
         Ok(())
     }
 }
@@ -143,11 +138,6 @@ pub async fn join_channel(
         ));
     }
     // user exists somewhere in the system, and channel is valid
-    // therefore we may need to create the user locally
-    if !discord_stateops::user_exists(state.clone(), &username) {
-        discord_stateops::create_user(state.clone(), username.clone())
-            .expect("user shouldn't exist");
-    }
     let mut state = state.lock().unwrap();
     let channel = state
         .channels
@@ -162,11 +152,6 @@ pub async fn join_channel(
     } else {
         // otherwise, add the user to the channel
         channel.users.insert(username.clone());
-        state
-            .user_channels
-            .get_mut(&username)
-            .unwrap()
-            .insert(channel_name.clone());
         Ok(())
     }
 }
@@ -209,22 +194,18 @@ pub async fn leave_channel(
         return Err((StatusCode::BAD_REQUEST, "User not in channel".to_owned()));
     }
     channel.users.remove(&username);
-    state
-        .user_channels
-        .get_mut(&username)
-        .unwrap()
-        .remove(&channel_name);
     Ok(())
 }
 
 // ==============================
 // Messages
 // ==============================
-pub fn send_message(
+pub async fn send_message(
     state: SharedState,
     channel_name: String,
     username: String,
     text: String,
+    user_exists: UserExistsFn,
 ) -> StateResult<String> {
     if !channel_name_is_valid(&channel_name) {
         return Err((
@@ -236,7 +217,7 @@ pub fn send_message(
     if !channel_exists(state.clone(), &channel_name) {
         return Err((StatusCode::NOT_FOUND, "Channel does not exist".to_owned()));
     }
-    if !user_exists(state.clone(), &username) {
+    if !user_exists(username.clone()).await {
         return Err((StatusCode::NOT_FOUND, "User does not exist".to_owned()));
     }
 
