@@ -5,14 +5,14 @@ use std::{
 };
 
 use axum::http::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{Config, Server},
     discord_stateops,
 };
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Message {
     pub username: String,
     pub text: String,

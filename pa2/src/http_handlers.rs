@@ -200,40 +200,77 @@ async fn send_message(
         json!({"channel": channel_name, "message_id": message_id, "username": existing_user.username, "text": body.text}),
     ))
 }
-// async fn get_messages(
-//     State(state): State<SharedState>,
-//     Path(channel_name): Path<String>,
-//     Query(params): Query<HashMap<String, String>>,
-// ) -> Result<impl IntoResponse, HttpServerError> {
-//     let mut limit = None;
-//     if let Some(lim) = params.get("limit")
-//         && !lim.is_empty()
-//     {
-//         let Ok(lim) = lim.parse::<usize>() else {
-//             return Err((
-//                 StatusCode::BAD_REQUEST,
-//                 "Invalid limit! Limit must be a nonnegative integer".to_string(),
-//             )
-//                 .into());
-//         };
-//         limit = Some(lim);
-//     }
-//     let mut offset = None;
-//     if let Some(off) = params.get("offset")
-//         && !off.is_empty()
-//     {
-//         let Ok(off) = off.parse::<usize>() else {
-//             return Err((
-//                 StatusCode::BAD_REQUEST,
-//                 "Invalid offset! Offset must be a nonnegative integer".to_string(),
-//             )
-//                 .into());
-//         };
-//         offset = Some(off);
-//     }
-//     let messages = discord_stateops::get_messages(state, channel_name.clone(), limit, offset)?;
-//     Ok(Json(json!({"channel": channel_name, "messages": messages})))
-// }
+async fn debug_get_messages(
+    State(state): State<SharedSystemState>,
+    Path(channel_name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, HttpServerError> {
+    let mut limit = None;
+    if let Some(lim) = params.get("limit")
+        && !lim.is_empty()
+    {
+        let Ok(lim) = lim.parse::<usize>() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Invalid limit! Limit must be a nonnegative integer".to_string(),
+            )
+                .into());
+        };
+        limit = Some(lim);
+    }
+    let mut offset = None;
+    if let Some(off) = params.get("offset")
+        && !off.is_empty()
+    {
+        let Ok(off) = off.parse::<usize>() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Invalid offset! Offset must be a nonnegative integer".to_string(),
+            )
+                .into());
+        };
+        offset = Some(off);
+    }
+    let messages =
+        distributed_stateops::debug_get_messages(state, channel_name.clone(), limit, offset)
+            .await?;
+    Ok(Json(json!({"channel": channel_name, "messages": messages})))
+}
+async fn get_messages(
+    State(state): State<SharedSystemState>,
+    Path(channel_name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, HttpServerError> {
+    let mut limit = None;
+    if let Some(lim) = params.get("limit")
+        && !lim.is_empty()
+    {
+        let Ok(lim) = lim.parse::<usize>() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Invalid limit! Limit must be a nonnegative integer".to_string(),
+            )
+                .into());
+        };
+        limit = Some(lim);
+    }
+    let mut offset = None;
+    if let Some(off) = params.get("offset")
+        && !off.is_empty()
+    {
+        let Ok(off) = off.parse::<usize>() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Invalid offset! Offset must be a nonnegative integer".to_string(),
+            )
+                .into());
+        };
+        offset = Some(off);
+    }
+    let messages =
+        distributed_stateops::get_messages(state, channel_name.clone(), limit, offset).await?;
+    Ok(Json(json!({"channel": channel_name, "messages": messages})))
+}
 
 async fn not_found() -> Result<impl IntoResponse, HttpServerError> {
     Err::<Json<Value>, HttpServerError>(
@@ -269,11 +306,14 @@ fn build_app(state: SharedSystemState) -> Router {
             "/debug/channels/{channel}/users",
             get(debug_list_channel_users),
         )
-        .route("/channels/{channel}/messages", post(send_message))
-        // .route(
-        //     "/channels/{channel}/messages",
-        //     post(send_message).get(get_messages),
-        // )
+        .route(
+            "/channels/{channel}/messages",
+            post(send_message).get(get_messages),
+        )
+        .route(
+            "/debug/channels/{channel}/messages",
+            get(debug_get_messages),
+        )
         // handling so that we return json, as requested, on these errors
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
