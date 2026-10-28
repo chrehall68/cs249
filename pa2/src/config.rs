@@ -27,3 +27,13 @@ pub fn get_config_for(config: &Config, id: &ServerId) -> Server {
     }
     panic!("No config for {id}");
 }
+pub fn validate_config(config: &Config) {
+    // all priorities should be unique
+    let mut priorities = HashMap::new();
+    for server in config {
+        if priorities.contains_key(&server.priority) {
+            panic!("Duplicate priority {}", server.priority);
+        }
+        priorities.insert(server.priority, ());
+    }
+}

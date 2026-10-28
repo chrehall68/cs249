@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::{
-    config::{get_config_for, read_config},
+    config::{get_config_for, read_config, validate_config},
     distributed_stateops::init_state,
     server_middleware::SystemState,
 };
@@ -38,6 +38,7 @@ async fn main() {
     );
     // read in the config file
     let config = read_config(&cli.config);
+    validate_config(&config);
     let server_config = get_config_for(&config, &cli.id);
 
     // build our application
@@ -46,23 +47,23 @@ async fn main() {
     let state = Arc::new(Mutex::new(AppState::new()));
     let state = Arc::new(Mutex::new(SystemState::new(
         state.clone(),
-        &config,
+        config.clone(),
         cli.id.clone(),
     )));
     init_state(state.clone());
-    let t1 = http_handlers::create_task(
+    let t1 = server_middleware::main_task(
+        state.clone(),
+        config.clone(),
+        cli.id.clone(),
+        server_config.host.clone(),
+        server_config.peer_port,
+    )
+    .await;
+    let t2 = http_handlers::create_task(
         state.clone(),
         server_config.host.clone(),
         server_config.http_port,
     );
-    let t2 = server_middleware::main_task(
-        state.clone(),
-        config.clone(),
-        cli.id.clone(),
-        server_config.host,
-        server_config.peer_port,
-    )
-    .await;
     t1.await.unwrap();
     t2.await.unwrap();
 }

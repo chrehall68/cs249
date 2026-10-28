@@ -16,7 +16,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
-use crate::config::Config;
+use crate::config::{Config, get_config_for};
 use crate::discord_stateops::SharedState;
 
 /// if the peer fails to respond to heartbeats, or explicitly sends a disconnect,
@@ -58,6 +58,7 @@ impl PeerState {
 }
 pub struct SystemState {
     discord: SharedState,
+    config: Config,
     /// id of this server
     id: String,
     /// id of the leader
@@ -73,18 +74,25 @@ pub struct SystemState {
 }
 
 impl SystemState {
-    pub fn new(app_state: SharedState, config: &Config, id: String) -> Self {
+    pub fn new(app_state: SharedState, config: Config, id: String) -> Self {
         let mut server_states = HashMap::new();
         let mut receivers = HashMap::new();
-        for server in config {
+        for server in &config {
             let (peer_state, rx) = PeerState::new(server.id.clone());
             server_states.insert(server.id.clone(), peer_state);
             receivers.insert(server.id.clone(), rx);
         }
+        let initial_leader = config
+            .iter()
+            .max_by(|a, b| a.priority.cmp(&b.priority))
+            .unwrap()
+            .id
+            .clone();
         Self {
             discord: app_state,
+            config,
             id,
-            leader: "C".to_owned(),
+            leader: initial_leader,
             server_states,
             on_failure: Arc::new(Notify::new()),
             receivers,
@@ -132,6 +140,10 @@ pub fn get_id(state: SharedSystemState) -> String {
 pub fn get_discord(state: SharedSystemState) -> SharedState {
     let state = state.lock().unwrap();
     state.discord.clone()
+}
+pub fn get_config(state: SharedSystemState) -> Config {
+    let state = state.lock().unwrap();
+    state.config.clone()
 }
 pub fn set_receive_callback(state: SharedSystemState, callback: ReceiveCallback) {
     let mut state = state.lock().unwrap();
@@ -295,11 +307,12 @@ async fn send_message_task(
 // announce self as leader if we're the leader
 async fn leader_announcement_task(state: SharedSystemState, peer_id: String) {
     // at start, send leader announcement if C
-    // TODO - make priorities config-based
+    let config = get_config(state.clone());
+    let max_priority = config.iter().map(|s| s.priority).max().unwrap();
     let id = get_id(state.clone());
     let sender = get_sender(state.clone(), peer_id.clone());
     let fail_notify = state.lock().unwrap().on_failure.clone();
-    if id == "C" {
+    if get_config_for(&config, &id).priority == max_priority {
         sender
             .send(MessageToSend {
                 message: json!({"type":"LEADER_ANNOUNCEMENT", "leader":id.clone()}),
@@ -317,7 +330,12 @@ async fn leader_announcement_task(state: SharedSystemState, peer_id: String) {
             .into_iter()
             .filter_map(|(server, is_alive)| if is_alive { Some(server) } else { None })
             .collect();
-        server_states.sort();
+        server_states.sort_by(|a, b| {
+            u8::cmp(
+                &get_config_for(&config, a).priority,
+                &get_config_for(&config, b).priority,
+            )
+        });
         server_states.reverse();
         if server_states[0] == id {
             set_leader(state.clone(), id.clone());
@@ -473,32 +491,28 @@ pub async fn main_task(
     // connect to all servers < my id (prevents us from launching multiple connections)
     for other_server in &config {
         if other_server.id < id {
-            {
-                // try up to 3 times (6 ish seconds) to connect, otherwise declare server dead
-                // do these before starting the http server that way, once the http server is running,
-                // we have the invariant that the sockets are connected
-                let state = state.clone();
-                let other_server = other_server.clone();
-                let mut socket =
+            // try up to 3 times (6 ish seconds) to connect, otherwise declare server dead
+            // do these before starting the http server that way, once the http server is running,
+            // we have the invariant that the sockets are connected
+            let state = state.clone();
+            let other_server = other_server.clone();
+            let mut socket =
+                TcpStream::connect(format!("{}:{}", other_server.host, other_server.peer_port))
+                    .await;
+            let mut iters = 0;
+            while socket.is_err() && iters < 3 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                socket =
                     TcpStream::connect(format!("{}:{}", other_server.host, other_server.peer_port))
                         .await;
-                let mut iters = 0;
-                while socket.is_err() && iters < 3 {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    socket = TcpStream::connect(format!(
-                        "{}:{}",
-                        other_server.host, other_server.peer_port
-                    ))
-                    .await;
-                    iters += 1;
+                iters += 1;
+            }
+            match socket {
+                Ok(socket) => {
+                    tokio::spawn(peer_task(socket, state.clone(), Some(other_server.id)));
                 }
-                match socket {
-                    Ok(socket) => {
-                        tokio::spawn(peer_task(socket, state.clone(), Some(other_server.id)));
-                    }
-                    Err(_) => {
-                        set_server_state(state, other_server.id, false);
-                    }
+                Err(_) => {
+                    set_server_state(state, other_server.id, false);
                 }
             }
         }
