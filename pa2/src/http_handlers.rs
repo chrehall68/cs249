@@ -1,4 +1,6 @@
-use crate::server_middleware::{SharedSystemState, get_id, get_leader, get_server_states};
+use crate::server_middleware::{
+    SharedSystemState, get_id, get_leader, get_server_state, get_server_states,
+};
 use crate::{discord_stateops, distributed_stateops};
 use std::collections::HashMap;
 
@@ -85,8 +87,9 @@ async fn servers(State(state): State<SharedSystemState>) -> Json<Value> {
     Json(json!({"servers":formatted}))
 }
 async fn leader(State(state): State<SharedSystemState>) -> Json<Value> {
-    let leader = get_leader(state);
-    Json(json!({"leader":leader, "alive":true}))
+    let leader = get_leader(state.clone());
+    let alive = get_server_state(state.clone(), &leader);
+    Json(json!({"leader":leader, "alive":alive}))
 }
 
 // ==================================================

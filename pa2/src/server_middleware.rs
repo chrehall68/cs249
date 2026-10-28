@@ -337,8 +337,17 @@ async fn leader_announcement_task(state: SharedSystemState, peer_id: String) {
             )
         });
         server_states.reverse();
+        // no matter what, make sure to update our leader
+        if get_leader(state.clone()) != server_states[0] {
+            println!(
+                "Because of failure, leader changed from {} to {}",
+                get_leader(state.clone()),
+                server_states[0]
+            );
+            set_leader(state.clone(), server_states[0].clone());
+        }
+        // and also maybe send a leader announcement if we're the leader
         if server_states[0] == id {
-            set_leader(state.clone(), id.clone());
             let _ = sender
                 .send(MessageToSend {
                     message: json!({"type":"LEADER_ANNOUNCEMENT", "leader":id.clone()}),
