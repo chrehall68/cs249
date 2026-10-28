@@ -104,11 +104,14 @@ pub fn get_server_state(state: SharedSystemState, server: &String) -> bool {
 }
 pub fn get_server_states(state: SharedSystemState) -> Vec<(String, bool)> {
     let state = state.lock().unwrap();
-    state
+    let mut server_states: Vec<_> = state
         .server_states
         .values()
         .map(|server| (server.peer_id.clone(), server.is_alive))
-        .collect()
+        .collect();
+    // gives us a constant ordering
+    server_states.sort();
+    server_states
 }
 pub fn set_leader(state: SharedSystemState, leader: String) {
     let mut state = state.lock().unwrap();

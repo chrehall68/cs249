@@ -1,6 +1,6 @@
 use std::{
     hash::{self, Hasher},
-    sync::{Arc, mpsc::channel},
+    sync::Arc,
 };
 
 use crate::{
@@ -552,7 +552,7 @@ pub async fn leave_channel(
             return state_result_from_value(&result);
         }
         // retry
-        Box::pin(join_channel(state, username, channel_name)).await
+        Box::pin(leave_channel(state, username, channel_name)).await
     }
 }
 

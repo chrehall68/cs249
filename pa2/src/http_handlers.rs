@@ -1,5 +1,4 @@
-use crate::discord_stateops::SharedState;
-use crate::server_middleware::{SharedSystemState, get_leader, get_server_states};
+use crate::server_middleware::{SharedSystemState, get_id, get_leader, get_server_states};
 use crate::{discord_stateops, distributed_stateops};
 use std::collections::HashMap;
 
@@ -74,14 +73,14 @@ where
 // ==================================================
 // System-related endpoints
 // ==================================================
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+async fn health(State(state): State<SharedSystemState>) -> Json<Value> {
+    Json(json!({"status": "ok", "server_id": get_id(state)}))
 }
 async fn servers(State(state): State<SharedSystemState>) -> Json<Value> {
     let server_states = get_server_states(state);
     let formatted: Vec<_> = server_states
         .into_iter()
-        .map(|(server, is_alive)| json!({"server_id":server, "is_alive":is_alive}))
+        .map(|(server, is_alive)| json!({"server_id":server, "alive":is_alive}))
         .collect();
     Json(json!({"servers":formatted}))
 }
@@ -100,7 +99,7 @@ struct PostUserRequest {
 async fn post_user(
     State(state): State<SharedSystemState>,
     body: Result<Json<PostUserRequest>, JsonRejection>,
-) -> Result<Json<Value>, HttpServerError> {
+) -> Result<impl IntoResponse, HttpServerError> {
     let Ok(body) = body else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -110,7 +109,10 @@ async fn post_user(
     };
     // forward to correct owner, or if we're the owner, handle it
     let () = distributed_stateops::create_user(state, body.username.clone()).await?;
-    Ok(Json(json!({"username": body.username.clone()})))
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"username": body.username.clone()})),
+    ))
 }
 async fn get_users(State(state): State<SharedSystemState>) -> Json<Value> {
     let users = distributed_stateops::get_users(state).await;
@@ -196,8 +198,11 @@ async fn send_message(
         body.text.clone(),
     )
     .await?;
-    Ok(Json(
-        json!({"channel": channel_name, "message_id": message_id, "username": existing_user.username, "text": body.text}),
+    Ok((
+        StatusCode::CREATED,
+        Json(
+            json!({"channel": channel_name, "message_id": message_id, "username": existing_user.username, "text": body.text}),
+        ),
     ))
 }
 async fn debug_get_messages(

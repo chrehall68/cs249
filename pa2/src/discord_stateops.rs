@@ -7,11 +7,6 @@ use std::{
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    config::{Config, Server},
-    discord_stateops,
-};
-
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Message {
     pub username: String,
@@ -47,7 +42,7 @@ pub struct AppState {
     channels: HashMap<String, Channel>,
 }
 impl AppState {
-    pub fn from(id: String, config: &Config) -> Self {
+    pub fn new() -> Self {
         Self {
             users: HashSet::new(),
             channels: HashMap::new(),

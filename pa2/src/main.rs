@@ -4,7 +4,7 @@ mod distributed_stateops;
 mod http_handlers;
 mod server_middleware;
 use clap::Parser;
-use discord_stateops::{AppState, SharedState};
+use discord_stateops::AppState;
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -13,7 +13,7 @@ use std::{
 use crate::{
     config::{get_config_for, read_config},
     distributed_stateops::init_state,
-    server_middleware::{SharedSystemState, SystemState},
+    server_middleware::SystemState,
 };
 
 #[derive(Parser)]
@@ -43,7 +43,7 @@ async fn main() {
     // build our application
     println!("server config: {:?}", server_config);
     println!("peers: {:?}", config);
-    let state: SharedState = Arc::new(Mutex::new(AppState::from(cli.id.clone(), &config)));
+    let state = Arc::new(Mutex::new(AppState::new()));
     let state = Arc::new(Mutex::new(SystemState::new(
         state.clone(),
         &config,
