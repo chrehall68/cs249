@@ -179,7 +179,7 @@ async fn send_pings_task(state: SharedSystemState, peer_id: String) {
         {
             let pending_heartbeats = pending_heartbeats.clone();
             let missed_heartbeats = missed_heartbeats.clone();
-            let app_state = state.clone();
+            let state = state.clone();
             let peer_id = peer_id.clone();
             tokio::spawn(async move {
                 sleep(Duration::from_secs(2)).await;
@@ -189,7 +189,8 @@ async fn send_pings_task(state: SharedSystemState, peer_id: String) {
                     missed_heartbeats.fetch_add(1, Ordering::SeqCst);
                     if missed_heartbeats.load(Ordering::SeqCst) == 3 {
                         println!("Peer {peer_id} missed 3 heartbeats, disconnecting");
-                        set_server_state(app_state, peer_id, false);
+                        set_server_state(state.clone(), peer_id, false);
+                        state.lock().unwrap().on_failure.notify_waiters();
                     }
                 }
             });
@@ -294,8 +295,9 @@ async fn send_message_task(
 // announce self as leader if we're the leader
 async fn leader_announcement_task(state: SharedSystemState, peer_id: String) {
     // at start, send leader announcement if C
-    let id = get_leader(state.clone());
-    let sender = get_sender(state.clone(), peer_id);
+    // TODO - make priorities config-based
+    let id = get_id(state.clone());
+    let sender = get_sender(state.clone(), peer_id.clone());
     let fail_notify = state.lock().unwrap().on_failure.clone();
     if id == "C" {
         sender
