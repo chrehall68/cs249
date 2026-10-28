@@ -179,7 +179,7 @@ async fn send_pings_task(state: SharedSystemState, peer_id: String) {
     let pending_heartbeats = Arc::new(Mutex::new(HashSet::new()));
     let mut key = 0;
 
-    loop {
+    while get_server_state(state.clone(), &peer_id) {
         // wait 2 seconds
         sleep(Duration::from_secs(2)).await;
         // set up acknowledgement machinery
@@ -201,8 +201,15 @@ async fn send_pings_task(state: SharedSystemState, peer_id: String) {
                     missed_heartbeats.fetch_add(1, Ordering::SeqCst);
                     if missed_heartbeats.load(Ordering::SeqCst) == 3 {
                         println!("Peer {peer_id} missed 3 heartbeats, disconnecting");
-                        set_server_state(state.clone(), peer_id, false);
+                        set_server_state(state.clone(), peer_id.clone(), false);
                         state.lock().unwrap().on_failure.notify_waiters();
+
+                        // drain the peer state callback queue
+                        let mut state = state.lock().unwrap();
+                        let peer_state = state.server_states.get_mut(&peer_id).unwrap();
+                        for (_, callback) in peer_state.seq_to_callback.drain() {
+                            callback(None);
+                        }
                     }
                 }
             });
@@ -225,28 +232,13 @@ async fn send_pings_task(state: SharedSystemState, peer_id: String) {
         };
 
         println!("Sending ping to {peer_id}");
-        let mut server_alive = get_server_state(state.clone(), &peer_id.clone());
-        if server_alive {
-            server_alive = sender
-                .send(MessageToSend {
-                    message: json!({"type":"PING", "from":id.clone()}),
-                    callback: Some(Box::new(on_ping_callback)),
-                    is_response: false,
-                })
-                .await
-                .is_ok();
-        }
-        if !server_alive {
-            println!("Peer {peer_id} is disconnected; stopping");
-            state.lock().unwrap().on_failure.notify_waiters();
-            // and drain the peer state callback queue
-            let mut state = state.lock().unwrap();
-            let peer_state = state.server_states.get_mut(&peer_id).unwrap();
-            for (_, callback) in peer_state.seq_to_callback.drain() {
-                callback(None);
-            }
-            break;
-        }
+        let _ = sender
+            .send(MessageToSend {
+                message: json!({"type":"PING", "from":id.clone()}),
+                callback: Some(Box::new(on_ping_callback)),
+                is_response: false,
+            })
+            .await;
     }
 }
 // message sending; there's a single one of these
@@ -408,7 +400,6 @@ async fn peer_task(mut socket: TcpStream, state: SharedSystemState, peer_id: Opt
     ));
     tokio::spawn(leader_announcement_task(state.clone(), peer_id.clone()));
 
-    let on_failure = state.lock().unwrap().on_failure.clone();
     let sender = get_sender(state.clone(), peer_id.clone());
 
     loop {
@@ -416,9 +407,7 @@ async fn peer_task(mut socket: TcpStream, state: SharedSystemState, peer_id: Opt
         while !cur_line.contains("\n") {
             let n = reader.read(&mut buf).await.unwrap();
             if n == 0 {
-                // peer disconnected
-                set_server_state(state.clone(), peer_id.clone(), false);
-                on_failure.notify_waiters();
+                // peer disconnected; this will get picked up by ping/ack task
                 return;
             }
             cur_line.push_str(std::str::from_utf8(&buf[0..n]).unwrap());
