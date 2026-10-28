@@ -199,12 +199,14 @@ async fn send_pings_task(state: SharedSystemState, peer_id: String) {
         let on_ping_callback: Callback = {
             let pending_heartbeats = pending_heartbeats.clone();
             let missed_heartbeats = missed_heartbeats.clone();
-            Box::new(move |_| {
-                println!("Received heartbeat");
-                let mut pending_heartbeats = pending_heartbeats.lock().unwrap();
-                if pending_heartbeats.contains(&cur_key) {
-                    pending_heartbeats.remove(&cur_key);
-                    missed_heartbeats.store(0, Ordering::SeqCst);
+            Box::new(move |result| {
+                if result.is_some() {
+                    println!("Received heartbeat");
+                    let mut pending_heartbeats = pending_heartbeats.lock().unwrap();
+                    if pending_heartbeats.contains(&cur_key) {
+                        pending_heartbeats.remove(&cur_key);
+                        missed_heartbeats.store(0, Ordering::SeqCst);
+                    }
                 }
             })
         };
@@ -224,6 +226,12 @@ async fn send_pings_task(state: SharedSystemState, peer_id: String) {
         if !server_alive {
             println!("Peer {peer_id} is disconnected; stopping");
             state.lock().unwrap().on_failure.notify_waiters();
+            // and drain the peer state callback queue
+            let mut state = state.lock().unwrap();
+            let peer_state = state.server_states.get_mut(&peer_id).unwrap();
+            for (_, callback) in peer_state.seq_to_callback.drain() {
+                callback(None);
+            }
             break;
         }
     }
@@ -263,17 +271,25 @@ async fn send_message_task(
 
         println!("Sending message to {peer_id}: {message_str}");
 
-        match socket.write_all(&message_str.as_bytes()).await {
-            Ok(_) => (),
-            Err(e) => {
-                // happens if peer disconnects
-                println!("Error sending message: {}", e);
-                break;
+        if get_server_state(state.clone(), &peer_id) {
+            match socket.write_all(&message_str.as_bytes()).await {
+                Ok(_) => (),
+                Err(e) => {
+                    // happens if peer disconnects
+                    // the peer failure will get found by the heartbeat or the main reading loop
+                    // so we will not set anything here
+                    println!("Error sending message: {}", e);
+                }
+            }
+        } else {
+            // just handle any callbacks
+            let mut state = state.lock().unwrap();
+            let peer_state = state.server_states.get_mut(&peer_id).unwrap();
+            for (_, callback) in peer_state.seq_to_callback.drain() {
+                callback(None);
             }
         }
     }
-    set_server_state(state.clone(), peer_id.clone(), false);
-    state.lock().unwrap().on_failure.notify_waiters();
 }
 // announce self as leader if we're the leader
 async fn leader_announcement_task(state: SharedSystemState, peer_id: String) {
@@ -384,8 +400,7 @@ async fn peer_task(mut socket: TcpStream, state: SharedSystemState, peer_id: Opt
         cur_line = String::from(rest);
 
         // then dispatch
-        let seq_num = value.get("sequence_number").unwrap().as_u64().unwrap();
-        let seq_num = seq_num as usize;
+        let seq_num = value.get("sequence_number").unwrap().as_u64().unwrap() as usize;
         if value.get("is_response").unwrap().as_bool().unwrap() {
             // it's a response
             let mut state = state.lock().unwrap();
