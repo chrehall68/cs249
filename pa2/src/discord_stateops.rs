@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     pin::Pin,
     sync::{Arc, Mutex},
 };
@@ -7,18 +7,25 @@ use std::{
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    config::{Config, Server},
-    discord_stateops,
-};
-
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub struct Message {
     pub username: String,
     pub text: String,
     /// Every message has a unique id of the form "{channel_name}-{numeric_message_id}"
     pub message_id: String,
 }
+impl Ord for Message {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.get_numeric_message_id()
+            .cmp(&other.get_numeric_message_id())
+    }
+}
+impl PartialOrd for Message {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl Message {
     pub fn new(username: String, text: String, message_id: String) -> Self {
         Self {
@@ -27,17 +34,27 @@ impl Message {
             message_id,
         }
     }
+    pub fn from(username: String, text: String, channel_name: &str, message_id: usize) -> Self {
+        Self {
+            username,
+            text,
+            message_id: format!("{}-{}", channel_name, message_id),
+        }
+    }
+    pub fn get_numeric_message_id(&self) -> usize {
+        self.message_id.split('-').last().unwrap().parse().unwrap()
+    }
 }
 pub struct Channel {
     users: HashSet<String>,
-    messages: Vec<Message>,
+    messages: BTreeSet<Message>,
     next_message_id: usize,
 }
 impl Channel {
     pub fn new() -> Self {
         Channel {
             users: HashSet::new(),
-            messages: Vec::new(),
+            messages: BTreeSet::new(),
             next_message_id: 0,
         }
     }
@@ -47,7 +64,7 @@ pub struct AppState {
     channels: HashMap<String, Channel>,
 }
 impl AppState {
-    pub fn from(id: String, config: &Config) -> Self {
+    pub fn new() -> Self {
         Self {
             users: HashSet::new(),
             channels: HashMap::new(),
@@ -59,12 +76,15 @@ impl AppState {
 // multiple handlers mutate the same `AppState` safely.
 // TODO - maybe worth using a RwLock here
 pub type SharedState = Arc<Mutex<AppState>>;
-/// (error code, error message)
-pub type StateError = (StatusCode, String);
+/// (http status, error code like "UNKNOWN_USER", error message)
+pub type StateError = (StatusCode, String, String);
 /// Return type for handlers
-/// on error, we have (error code, error message)
+/// on error, we have (http status, error code, error message)
 /// on success, we have the value
 pub type StateResult<T> = Result<T, StateError>;
+pub fn state_error(status: StatusCode, code: &str, message: &str) -> StateError {
+    (status, code.to_owned(), message.to_owned())
+}
 
 // ==============================
 // Users
@@ -79,11 +99,22 @@ pub fn user_exists(state: SharedState, username: &str) -> bool {
 }
 /// Returns the username, if the user was successfully created
 pub fn create_user(state: SharedState, username: String) -> StateResult<()> {
-    if user_exists(state.clone(), &username) {
-        Err((StatusCode::BAD_REQUEST, "User already exists".to_string()))
+    if username.is_empty() {
+        return Err(state_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_USERNAME",
+            "Empty username",
+        ));
+    }
+    let mut state = state.lock().unwrap();
+    let inserted = state.users.insert(username.clone());
+    if !inserted {
+        Err(state_error(
+            StatusCode::CONFLICT,
+            "DUPLICATE_USER",
+            "User already exists",
+        ))
     } else {
-        let mut state = state.lock().unwrap();
-        state.users.insert(username.clone());
         Ok(())
     }
 }
@@ -108,9 +139,10 @@ fn channel_exists(state: SharedState, channel_name: &str) -> bool {
 }
 pub fn create_channel(state: SharedState, channel_name: String) -> StateResult<()> {
     if channel_exists(state.clone(), &channel_name) {
-        Err((
-            StatusCode::BAD_REQUEST,
-            "Channel already exists".to_string(),
+        Err(state_error(
+            StatusCode::CONFLICT,
+            "DUPLICATE_CHANNEL",
+            "Channel already exists",
         ))
     } else {
         let mut state = state.lock().unwrap();
@@ -129,12 +161,17 @@ pub async fn join_channel(
 ) -> StateResult<()> {
     // validate that user exists somewhere in the system
     if !user_exists(username.clone()).await {
-        return Err((StatusCode::BAD_REQUEST, "User does not exist".to_string()));
+        return Err(state_error(
+            StatusCode::NOT_FOUND,
+            "UNKNOWN_USER",
+            "User does not exist",
+        ));
     }
     if !channel_name_is_valid(&channel_name) {
-        return Err((
+        return Err(state_error(
             StatusCode::BAD_REQUEST,
-            "Channel must start with #".to_owned(),
+            "INVALID_CHANNEL_NAME",
+            "Channel must start with #",
         ));
     }
     // user exists somewhere in the system, and channel is valid
@@ -145,9 +182,10 @@ pub async fn join_channel(
         .or_insert(Channel::new());
     if channel.users.contains(&username) {
         // duplicate
-        Err((
-            StatusCode::BAD_REQUEST,
-            "User already in channel".to_owned(),
+        Err(state_error(
+            StatusCode::CONFLICT,
+            "ALREADY_MEMBER",
+            "User already in channel",
         ))
     } else {
         // otherwise, add the user to the channel
@@ -157,13 +195,18 @@ pub async fn join_channel(
 }
 pub fn list_channel_users(state: SharedState, channel_name: String) -> StateResult<Vec<String>> {
     if !channel_name_is_valid(&channel_name) {
-        return Err((
+        return Err(state_error(
             StatusCode::BAD_REQUEST,
-            "Channel must start with #".to_owned(),
+            "INVALID_CHANNEL_NAME",
+            "Channel must start with #",
         ));
     }
     if !channel_exists(state.clone(), &channel_name) {
-        return Err((StatusCode::NOT_FOUND, "Channel does not exist".to_owned()));
+        return Err(state_error(
+            StatusCode::NOT_FOUND,
+            "UNKNOWN_CHANNEL",
+            "Channel does not exist",
+        ));
     }
     let state = state.lock().unwrap();
     let channel = state.channels.get(&channel_name).unwrap();
@@ -176,22 +219,35 @@ pub async fn leave_channel(
     user_exists: UserExistsFn,
 ) -> StateResult<()> {
     if !channel_name_is_valid(&channel_name) {
-        return Err((
+        return Err(state_error(
             StatusCode::BAD_REQUEST,
-            "Channel must start with #".to_owned(),
+            "INVALID_CHANNEL_NAME",
+            "Channel must start with #",
         ));
     }
     // we have a valid channel, now look it up
     if !channel_exists(state.clone(), &channel_name) {
-        return Err((StatusCode::NOT_FOUND, "Channel does not exist".to_owned()));
+        return Err(state_error(
+            StatusCode::NOT_FOUND,
+            "UNKNOWN_CHANNEL",
+            "Channel does not exist",
+        ));
     }
     if !user_exists(username.clone()).await {
-        return Err((StatusCode::NOT_FOUND, "User does not exist".to_owned()));
+        return Err(state_error(
+            StatusCode::NOT_FOUND,
+            "UNKNOWN_USER",
+            "User does not exist",
+        ));
     }
     let mut state = state.lock().unwrap();
     let channel = state.channels.get_mut(&channel_name).unwrap();
     if !channel.users.contains(&username) {
-        return Err((StatusCode::BAD_REQUEST, "User not in channel".to_owned()));
+        return Err(state_error(
+            StatusCode::NOT_FOUND,
+            "NOT_A_MEMBER",
+            "User not in channel",
+        ));
     }
     channel.users.remove(&username);
     Ok(())
@@ -200,6 +256,24 @@ pub async fn leave_channel(
 // ==============================
 // Messages
 // ==============================
+// unlike other functions, this requires its own special replication because of the fact
+// that we assign id's
+pub async fn replicate_send_message(
+    state: SharedState,
+    channel_name: String,
+    username: String,
+    text: String,
+    message_id: String,
+) -> StateResult<String> {
+    let mut state = state.lock().unwrap();
+    let channel = state.channels.get_mut(&channel_name).unwrap();
+    let did_insert = channel
+        .messages
+        .insert(Message::new(username, text, message_id.clone()));
+    // after all replications, then the replica's next_message_id will match the primary's
+    channel.next_message_id += did_insert as usize;
+    Ok(message_id)
+}
 pub async fn send_message(
     state: SharedState,
     channel_name: String,
@@ -208,32 +282,45 @@ pub async fn send_message(
     user_exists: UserExistsFn,
 ) -> StateResult<String> {
     if !channel_name_is_valid(&channel_name) {
-        return Err((
+        return Err(state_error(
             StatusCode::BAD_REQUEST,
-            "Channel must start with #".to_owned(),
+            "INVALID_CHANNEL_NAME",
+            "Channel must start with #",
         ));
     }
     // we have a valid channel, now look it up
     if !channel_exists(state.clone(), &channel_name) {
-        return Err((StatusCode::NOT_FOUND, "Channel does not exist".to_owned()));
+        return Err(state_error(
+            StatusCode::NOT_FOUND,
+            "UNKNOWN_CHANNEL",
+            "Channel does not exist",
+        ));
     }
     if !user_exists(username.clone()).await {
-        return Err((StatusCode::NOT_FOUND, "User does not exist".to_owned()));
+        return Err(state_error(
+            StatusCode::NOT_FOUND,
+            "UNKNOWN_USER",
+            "User does not exist",
+        ));
     }
 
     let mut state = state.lock().unwrap();
     let channel = state.channels.get_mut(&channel_name).unwrap();
     if !channel.users.contains(&username) {
-        return Err((StatusCode::BAD_REQUEST, "User not in channel".to_owned()));
+        // sending to a channel you haven't joined is an unauthorized channel operation
+        return Err(state_error(
+            StatusCode::FORBIDDEN,
+            "NOT_A_MEMBER",
+            "User not in channel",
+        ));
     }
-    let message_id = channel.next_message_id;
-    let message_id = format!("{}-{}", channel_name, message_id);
+    let numeric_message_id = channel.next_message_id;
     channel.next_message_id += 1;
-    // get channel mutably now
+    // then insert
     let channel = state.channels.get_mut(&channel_name).unwrap();
-    let message = Message::new(username, text, message_id.clone());
-    channel.messages.push(message);
-    Ok(message_id)
+    let message = Message::from(username, text, &channel_name, numeric_message_id);
+    channel.messages.insert(message.clone());
+    Ok(message.message_id)
 }
 /// Returns a list of messages
 /// default limit is 20
@@ -245,14 +332,19 @@ pub fn get_messages(
     offset: Option<usize>,
 ) -> StateResult<Vec<Message>> {
     if !channel_name_is_valid(&channel_name) {
-        return Err((
+        return Err(state_error(
             StatusCode::BAD_REQUEST,
-            "Channel must start with #".to_owned(),
+            "INVALID_CHANNEL_NAME",
+            "Channel must start with #",
         ));
     }
     // we have a valid channel, now look it up
     if !channel_exists(state.clone(), &channel_name) {
-        return Err((StatusCode::NOT_FOUND, "Channel does not exist".to_owned()));
+        return Err(state_error(
+            StatusCode::NOT_FOUND,
+            "UNKNOWN_CHANNEL",
+            "Channel does not exist",
+        ));
     }
     let mut state = state.lock().unwrap();
     let channel = state.channels.get_mut(&channel_name).unwrap();

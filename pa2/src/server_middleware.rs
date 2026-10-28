@@ -16,7 +16,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
-use crate::config::Config;
+use crate::config::{Config, get_config_for};
 use crate::discord_stateops::SharedState;
 
 /// if the peer fails to respond to heartbeats, or explicitly sends a disconnect,
@@ -58,6 +58,7 @@ impl PeerState {
 }
 pub struct SystemState {
     discord: SharedState,
+    config: Config,
     /// id of this server
     id: String,
     /// id of the leader
@@ -73,18 +74,25 @@ pub struct SystemState {
 }
 
 impl SystemState {
-    pub fn new(app_state: SharedState, config: &Config, id: String) -> Self {
+    pub fn new(app_state: SharedState, config: Config, id: String) -> Self {
         let mut server_states = HashMap::new();
         let mut receivers = HashMap::new();
-        for server in config {
+        for server in &config {
             let (peer_state, rx) = PeerState::new(server.id.clone());
             server_states.insert(server.id.clone(), peer_state);
             receivers.insert(server.id.clone(), rx);
         }
+        let initial_leader = config
+            .iter()
+            .max_by(|a, b| a.priority.cmp(&b.priority))
+            .unwrap()
+            .id
+            .clone();
         Self {
             discord: app_state,
+            config,
             id,
-            leader: "C".to_owned(),
+            leader: initial_leader,
             server_states,
             on_failure: Arc::new(Notify::new()),
             receivers,
@@ -104,11 +112,14 @@ pub fn get_server_state(state: SharedSystemState, server: &String) -> bool {
 }
 pub fn get_server_states(state: SharedSystemState) -> Vec<(String, bool)> {
     let state = state.lock().unwrap();
-    state
+    let mut server_states: Vec<_> = state
         .server_states
         .values()
         .map(|server| (server.peer_id.clone(), server.is_alive))
-        .collect()
+        .collect();
+    // gives us a constant ordering
+    server_states.sort();
+    server_states
 }
 pub fn set_leader(state: SharedSystemState, leader: String) {
     let mut state = state.lock().unwrap();
@@ -129,6 +140,10 @@ pub fn get_id(state: SharedSystemState) -> String {
 pub fn get_discord(state: SharedSystemState) -> SharedState {
     let state = state.lock().unwrap();
     state.discord.clone()
+}
+pub fn get_config(state: SharedSystemState) -> Config {
+    let state = state.lock().unwrap();
+    state.config.clone()
 }
 pub fn set_receive_callback(state: SharedSystemState, callback: ReceiveCallback) {
     let mut state = state.lock().unwrap();
@@ -164,7 +179,7 @@ async fn send_pings_task(state: SharedSystemState, peer_id: String) {
     let pending_heartbeats = Arc::new(Mutex::new(HashSet::new()));
     let mut key = 0;
 
-    loop {
+    while get_server_state(state.clone(), &peer_id) {
         // wait 2 seconds
         sleep(Duration::from_secs(2)).await;
         // set up acknowledgement machinery
@@ -176,17 +191,30 @@ async fn send_pings_task(state: SharedSystemState, peer_id: String) {
         {
             let pending_heartbeats = pending_heartbeats.clone();
             let missed_heartbeats = missed_heartbeats.clone();
-            let app_state = state.clone();
+            let state = state.clone();
             let peer_id = peer_id.clone();
             tokio::spawn(async move {
                 sleep(Duration::from_secs(2)).await;
-                let mut pending_heartbeats = pending_heartbeats.lock().unwrap();
-                if pending_heartbeats.contains(&cur_key) {
-                    pending_heartbeats.remove(&cur_key);
-                    missed_heartbeats.fetch_add(1, Ordering::SeqCst);
-                    if missed_heartbeats.load(Ordering::SeqCst) == 3 {
-                        println!("Peer {peer_id} missed 3 heartbeats, disconnecting");
-                        set_server_state(app_state, peer_id, false);
+                let peer_died = {
+                    let mut pending_heartbeats = pending_heartbeats.lock().unwrap();
+                    if pending_heartbeats.contains(&cur_key) {
+                        pending_heartbeats.remove(&cur_key);
+                        missed_heartbeats.fetch_add(1, Ordering::SeqCst);
+                        missed_heartbeats.load(Ordering::SeqCst) == 3
+                    } else {
+                        false
+                    }
+                };
+                if peer_died {
+                    println!("Peer {peer_id} missed 3 heartbeats, disconnecting");
+                    set_server_state(state.clone(), peer_id.clone(), false);
+                    state.lock().unwrap().on_failure.notify_waiters();
+
+                    // drain the peer state callback queue
+                    let mut state = state.lock().unwrap();
+                    let peer_state = state.server_states.get_mut(&peer_id).unwrap();
+                    for (_, callback) in peer_state.seq_to_callback.drain() {
+                        callback(None);
                     }
                 }
             });
@@ -196,33 +224,26 @@ async fn send_pings_task(state: SharedSystemState, peer_id: String) {
         let on_ping_callback: Callback = {
             let pending_heartbeats = pending_heartbeats.clone();
             let missed_heartbeats = missed_heartbeats.clone();
-            Box::new(move |_| {
-                println!("Received heartbeat");
-                let mut pending_heartbeats = pending_heartbeats.lock().unwrap();
-                if pending_heartbeats.contains(&cur_key) {
-                    pending_heartbeats.remove(&cur_key);
-                    missed_heartbeats.store(0, Ordering::SeqCst);
+            Box::new(move |result| {
+                if result.is_some() {
+                    println!("Received heartbeat");
+                    let mut pending_heartbeats = pending_heartbeats.lock().unwrap();
+                    if pending_heartbeats.contains(&cur_key) {
+                        pending_heartbeats.remove(&cur_key);
+                        missed_heartbeats.store(0, Ordering::SeqCst);
+                    }
                 }
             })
         };
 
         println!("Sending ping to {peer_id}");
-        let mut server_alive = get_server_state(state.clone(), &peer_id.clone());
-        if server_alive {
-            server_alive = sender
-                .send(MessageToSend {
-                    message: json!({"type":"PING", "from":id.clone()}),
-                    callback: Some(Box::new(on_ping_callback)),
-                    is_response: false,
-                })
-                .await
-                .is_ok();
-        }
-        if !server_alive {
-            println!("Peer {peer_id} is disconnected; stopping");
-            state.lock().unwrap().on_failure.notify_waiters();
-            break;
-        }
+        let _ = sender
+            .send(MessageToSend {
+                message: json!({"type":"PING", "from":id.clone()}),
+                callback: Some(Box::new(on_ping_callback)),
+                is_response: false,
+            })
+            .await;
     }
 }
 // message sending; there's a single one of these
@@ -260,25 +281,35 @@ async fn send_message_task(
 
         println!("Sending message to {peer_id}: {message_str}");
 
-        match socket.write_all(&message_str.as_bytes()).await {
-            Ok(_) => (),
-            Err(e) => {
-                // happens if peer disconnects
-                println!("Error sending message: {}", e);
-                break;
+        if get_server_state(state.clone(), &peer_id) {
+            match socket.write_all(&message_str.as_bytes()).await {
+                Ok(_) => (),
+                Err(e) => {
+                    // happens if peer disconnects
+                    // the peer failure will get found by the heartbeat or the main reading loop
+                    // so we will not set anything here
+                    println!("Error sending message: {}", e);
+                }
+            }
+        } else {
+            // just handle any callbacks
+            let mut state = state.lock().unwrap();
+            let peer_state = state.server_states.get_mut(&peer_id).unwrap();
+            for (_, callback) in peer_state.seq_to_callback.drain() {
+                callback(None);
             }
         }
     }
-    set_server_state(state.clone(), peer_id.clone(), false);
-    state.lock().unwrap().on_failure.notify_waiters();
 }
 // announce self as leader if we're the leader
 async fn leader_announcement_task(state: SharedSystemState, peer_id: String) {
     // at start, send leader announcement if C
-    let id = get_leader(state.clone());
-    let sender = get_sender(state.clone(), peer_id);
+    let config = get_config(state.clone());
+    let max_priority = config.iter().map(|s| s.priority).max().unwrap();
+    let id = get_id(state.clone());
+    let sender = get_sender(state.clone(), peer_id.clone());
     let fail_notify = state.lock().unwrap().on_failure.clone();
-    if id == "C" {
+    if get_config_for(&config, &id).priority == max_priority {
         sender
             .send(MessageToSend {
                 message: json!({"type":"LEADER_ANNOUNCEMENT", "leader":id.clone()}),
@@ -296,10 +327,24 @@ async fn leader_announcement_task(state: SharedSystemState, peer_id: String) {
             .into_iter()
             .filter_map(|(server, is_alive)| if is_alive { Some(server) } else { None })
             .collect();
-        server_states.sort();
+        server_states.sort_by(|a, b| {
+            u8::cmp(
+                &get_config_for(&config, a).priority,
+                &get_config_for(&config, b).priority,
+            )
+        });
         server_states.reverse();
+        // no matter what, make sure to update our leader
+        if get_leader(state.clone()) != server_states[0] {
+            println!(
+                "Because of failure, leader changed from {} to {}",
+                get_leader(state.clone()),
+                server_states[0]
+            );
+            set_leader(state.clone(), server_states[0].clone());
+        }
+        // and also maybe send a leader announcement if we're the leader
         if server_states[0] == id {
-            set_leader(state.clone(), id.clone());
             let _ = sender
                 .send(MessageToSend {
                     message: json!({"type":"LEADER_ANNOUNCEMENT", "leader":id.clone()}),
@@ -360,7 +405,6 @@ async fn peer_task(mut socket: TcpStream, state: SharedSystemState, peer_id: Opt
     ));
     tokio::spawn(leader_announcement_task(state.clone(), peer_id.clone()));
 
-    let on_failure = state.lock().unwrap().on_failure.clone();
     let sender = get_sender(state.clone(), peer_id.clone());
 
     loop {
@@ -368,9 +412,7 @@ async fn peer_task(mut socket: TcpStream, state: SharedSystemState, peer_id: Opt
         while !cur_line.contains("\n") {
             let n = reader.read(&mut buf).await.unwrap();
             if n == 0 {
-                // peer disconnected
-                set_server_state(state.clone(), peer_id.clone(), false);
-                on_failure.notify_waiters();
+                // peer disconnected; this will get picked up by ping/ack task
                 return;
             }
             cur_line.push_str(std::str::from_utf8(&buf[0..n]).unwrap());
@@ -381,8 +423,7 @@ async fn peer_task(mut socket: TcpStream, state: SharedSystemState, peer_id: Opt
         cur_line = String::from(rest);
 
         // then dispatch
-        let seq_num = value.get("sequence_number").unwrap().as_u64().unwrap();
-        let seq_num = seq_num as usize;
+        let seq_num = value.get("sequence_number").unwrap().as_u64().unwrap() as usize;
         if value.get("is_response").unwrap().as_bool().unwrap() {
             // it's a response
             let mut state = state.lock().unwrap();
@@ -453,15 +494,30 @@ pub async fn main_task(
     // connect to all servers < my id (prevents us from launching multiple connections)
     for other_server in &config {
         if other_server.id < id {
-            let socket =
+            // try up to 3 times (6 ish seconds) to connect, otherwise declare server dead
+            // do these before starting the http server that way, once the http server is running,
+            // we have the invariant that the sockets are connected
+            let state = state.clone();
+            let other_server = other_server.clone();
+            let mut socket =
                 TcpStream::connect(format!("{}:{}", other_server.host, other_server.peer_port))
-                    .await
-                    .unwrap();
-            tokio::spawn(peer_task(
-                socket,
-                state.clone(),
-                Some(other_server.id.clone()),
-            ));
+                    .await;
+            let mut iters = 0;
+            while socket.is_err() && iters < 3 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                socket =
+                    TcpStream::connect(format!("{}:{}", other_server.host, other_server.peer_port))
+                        .await;
+                iters += 1;
+            }
+            match socket {
+                Ok(socket) => {
+                    tokio::spawn(peer_task(socket, state.clone(), Some(other_server.id)));
+                }
+                Err(_) => {
+                    set_server_state(state, other_server.id, false);
+                }
+            }
         }
     }
     // listener
