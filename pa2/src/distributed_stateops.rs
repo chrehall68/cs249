@@ -26,17 +26,24 @@ struct LocationConfig {
 // ==============================
 
 /// wire format for a StateResult:
-/// {"ok": <value>} on success, {"error": {"code": <u16>, "message": <string>}} on failure
+/// {"ok": <value>} on success,
+/// {"error": {"status": <u16>, "code": <string>, "message": <string>}} on failure
 fn state_result_to_value<T: Serialize>(result: StateResult<T>) -> Value {
     match result {
         Ok(v) => json!({"ok": v}),
-        Err((code, message)) => json!({"error": {"code": code.as_u16(), "message": message}}),
+        Err((status, code, message)) => {
+            json!({"error": {"status": status.as_u16(), "code": code, "message": message}})
+        }
     }
 }
 fn state_result_from_value<T: DeserializeOwned>(value: &Value) -> StateResult<T> {
     if let Some(error) = value.get("error") {
-        let code = StatusCode::from_u16(error["code"].as_u64().unwrap() as u16).unwrap();
-        Err((code, error["message"].as_str().unwrap().to_string()))
+        let status = StatusCode::from_u16(error["status"].as_u64().unwrap() as u16).unwrap();
+        Err((
+            status,
+            error["code"].as_str().unwrap().to_string(),
+            error["message"].as_str().unwrap().to_string(),
+        ))
     } else {
         Ok(serde_json::from_value(value["ok"].clone()).unwrap())
     }
@@ -53,7 +60,9 @@ async fn forward_request_to(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let callback = {
         Box::new(move |result| {
-            tx.send(result).unwrap();
+            // fails if the waiting request was dropped (e.g. the http client gave up);
+            // nothing is waiting for the result then, so ignore it
+            let _ = tx.send(result);
         })
     };
     send_request(
@@ -64,7 +73,8 @@ async fn forward_request_to(
         Some(callback),
     )
     .await;
-    rx.await.unwrap()
+    // a dropped callback means we'll never get a response, same as the peer being down
+    rx.await.ok().flatten()
 }
 /// request should contain any necessary parameters
 async fn replicate_op(
@@ -301,15 +311,18 @@ pub async fn create_user(state: SharedSystemState, username: String) -> StateRes
             return Ok(());
         }
         let message = json!({"username": username});
-        let forward_result = replicate_op(
+        match replicate_op(
             state.clone(),
             message,
             "create_user".to_owned(),
             config.backup,
         )
         .await
-        .unwrap();
-        state_result_from_value(&forward_result)
+        {
+            Some(forward_result) => state_result_from_value(&forward_result),
+            // backup went down while we waited; the primary already has the change
+            None => Ok(()),
+        }
     } else {
         // send a request to whatever is up out of the two
         let request = json!({"username": username});
@@ -333,12 +346,13 @@ pub async fn get_users(state: SharedSystemState) -> Vec<String> {
     let mut all_users = get_my_users(state.clone()).await;
     for (peer_id, is_alive) in other_servers {
         if peer_id != id && is_alive {
-            let mut other_users = state_result_from_value(
-                &forward_request_to(state.clone(), json!({}), "get_users".to_owned(), peer_id)
-                    .await
-                    .unwrap(),
-            )
-            .unwrap();
+            // skip peers that go down while we wait
+            let Some(result) =
+                forward_request_to(state.clone(), json!({}), "get_users".to_owned(), peer_id).await
+            else {
+                continue;
+            };
+            let mut other_users = state_result_from_value(&result).unwrap();
             all_users.append(&mut other_users);
         }
     }
@@ -405,13 +419,15 @@ pub async fn get_channels(state: SharedSystemState) -> Vec<String> {
     let mut all_channels = get_my_channels(state.clone()).await;
     for (peer_id, is_alive) in other_servers {
         if peer_id != id && is_alive {
-            let mut other_users = state_result_from_value(
-                &forward_request_to(state.clone(), json!({}), "get_channels".to_owned(), peer_id)
+            // skip peers that go down while we wait
+            let Some(result) =
+                forward_request_to(state.clone(), json!({}), "get_channels".to_owned(), peer_id)
                     .await
-                    .unwrap(),
-            )
-            .unwrap();
-            all_channels.append(&mut other_users);
+            else {
+                continue;
+            };
+            let mut other_channels = state_result_from_value(&result).unwrap();
+            all_channels.append(&mut other_channels);
         }
     }
     all_channels.sort();
@@ -478,15 +494,18 @@ pub async fn join_channel(
             return Ok(());
         }
         let message = json!({"username": username, "channel": channel_name});
-        let forward_result = replicate_op(
+        match replicate_op(
             state.clone(),
             message,
             "join_channel".to_owned(),
             config.backup,
         )
         .await
-        .unwrap();
-        state_result_from_value(&forward_result)
+        {
+            Some(forward_result) => state_result_from_value(&forward_result),
+            // backup went down while we waited; the primary already has the change
+            None => Ok(()),
+        }
     } else {
         // send a request to whatever is up out of the two
         let request = json!({"username": username, "channel": channel_name});
@@ -530,15 +549,18 @@ pub async fn leave_channel(
             return Ok(());
         }
         let message = json!({"username": username, "channel": channel_name});
-        let forward_result = replicate_op(
+        match replicate_op(
             state.clone(),
             message,
             "leave_channel".to_owned(),
             config.backup,
         )
         .await
-        .unwrap();
-        state_result_from_value(&forward_result)
+        {
+            Some(forward_result) => state_result_from_value(&forward_result),
+            // backup went down while we waited; the primary already has the change
+            None => Ok(()),
+        }
     } else {
         // send a request to whatever is up out of the two
         let request = json!({"username": username, "channel": channel_name});
@@ -588,15 +610,18 @@ pub async fn send_message(
             return Ok(message_id);
         }
         let message = json!({"username": username, "channel": channel_name, "text": text, "message_id": message_id});
-        let forward_result = replicate_op(
+        match replicate_op(
             state.clone(),
             message,
             "send_message".to_owned(),
             config.backup,
         )
         .await
-        .unwrap();
-        state_result_from_value(&forward_result)
+        {
+            Some(forward_result) => state_result_from_value(&forward_result),
+            // backup went down while we waited; the primary already has the message
+            None => Ok(message_id),
+        }
     } else {
         // send a request to whatever is up out of the two
         let request = json!({"username": username, "channel": channel_name, "text": text});

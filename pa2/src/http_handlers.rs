@@ -1,3 +1,4 @@
+use crate::discord_stateops::state_error;
 use crate::server_middleware::{
     SharedSystemState, get_id, get_leader, get_server_state, get_server_states,
 };
@@ -17,29 +18,38 @@ use tokio::task::JoinHandle;
 
 // convert errors from stateops to http errors
 struct HttpServerError {
-    status: String,
+    status: StatusCode,
+    code: String,
     message: String,
-    code: StatusCode,
 }
 impl From<discord_stateops::StateError> for HttpServerError {
     fn from(e: discord_stateops::StateError) -> Self {
         HttpServerError {
-            status: "error".to_string(),
-            message: e.1,
-            code: e.0,
+            status: e.0,
+            code: e.1,
+            message: e.2,
         }
     }
 }
 impl IntoResponse for HttpServerError {
     fn into_response(self) -> Response {
         (
-            self.code,
-            Json(
-                json!({"status": self.status, "code": self.code.as_u16(), "message": self.message}),
-            ),
+            self.status,
+            Json(json!({"status": "error", "code": self.code, "message": self.message})),
         )
             .into_response()
     }
+}
+// invalid json syntax vs valid json that is missing/has wrongly typed fields
+fn json_rejection_error(rejection: JsonRejection, expected: &str) -> HttpServerError {
+    let (code, message) = match rejection {
+        JsonRejection::JsonDataError(_) => (
+            "MISSING_FIELD",
+            format!("Request body must be a json object with a {expected} field"),
+        ),
+        _ => ("INVALID_JSON", format!("Invalid json body: {rejection}")),
+    };
+    state_error(StatusCode::BAD_REQUEST, code, &message).into()
 }
 // header extraction
 struct ExistingUser {
@@ -53,18 +63,20 @@ where
 
     async fn from_request_parts(parts: &mut Parts, _s: &S) -> Result<Self, Self::Rejection> {
         let Some(username_value) = parts.headers.get("X-User") else {
-            return Err((
+            let error = state_error(
                 StatusCode::BAD_REQUEST,
-                Json(json!({"status": "error", "code": 400, "message":"Missing username header"})),
-            )
-                .into_response());
+                "MISSING_HEADER",
+                "Missing X-User header",
+            );
+            return Err(HttpServerError::from(error).into_response());
         };
         let Ok(username) = username_value.to_str() else {
-            return Err((
+            let error = state_error(
                 StatusCode::BAD_REQUEST,
-                Json(json!({"status": "error", "code": 400, "message":"Invalid username header"})),
-            )
-                .into_response());
+                "INVALID_USERNAME",
+                "Invalid X-User header",
+            );
+            return Err(HttpServerError::from(error).into_response());
         };
         Ok(ExistingUser {
             username: username.to_owned(),
@@ -103,13 +115,7 @@ async fn post_user(
     State(state): State<SharedSystemState>,
     body: Result<Json<PostUserRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, HttpServerError> {
-    let Ok(body) = body else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Invalid request body; must be valid json with a username field".to_string(),
-        )
-            .into());
-    };
+    let body = body.map_err(|rejection| json_rejection_error(rejection, "username"))?;
     // forward to correct owner, or if we're the owner, handle it
     let () = distributed_stateops::create_user(state, body.username.clone()).await?;
     Ok((
@@ -187,13 +193,7 @@ async fn send_message(
     Path(channel_name): Path<String>,
     body: Result<Json<SendMessageBody>, JsonRejection>,
 ) -> Result<impl IntoResponse, HttpServerError> {
-    let Ok(body) = body else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Invalid request body; must be valid json with a text field".to_string(),
-        )
-            .into());
-    };
+    let body = body.map_err(|rejection| json_rejection_error(rejection, "text"))?;
     let message_id = distributed_stateops::send_message(
         state,
         channel_name.clone(),
@@ -218,11 +218,12 @@ async fn debug_get_messages(
         && !lim.is_empty()
     {
         let Ok(lim) = lim.parse::<usize>() else {
-            return Err((
+            return Err(state_error(
                 StatusCode::BAD_REQUEST,
-                "Invalid limit! Limit must be a nonnegative integer".to_string(),
+                "INVALID_QUERY",
+                "Invalid limit! Limit must be a nonnegative integer",
             )
-                .into());
+            .into());
         };
         limit = Some(lim);
     }
@@ -231,11 +232,12 @@ async fn debug_get_messages(
         && !off.is_empty()
     {
         let Ok(off) = off.parse::<usize>() else {
-            return Err((
+            return Err(state_error(
                 StatusCode::BAD_REQUEST,
-                "Invalid offset! Offset must be a nonnegative integer".to_string(),
+                "INVALID_QUERY",
+                "Invalid offset! Offset must be a nonnegative integer",
             )
-                .into());
+            .into());
         };
         offset = Some(off);
     }
@@ -254,11 +256,12 @@ async fn get_messages(
         && !lim.is_empty()
     {
         let Ok(lim) = lim.parse::<usize>() else {
-            return Err((
+            return Err(state_error(
                 StatusCode::BAD_REQUEST,
-                "Invalid limit! Limit must be a nonnegative integer".to_string(),
+                "INVALID_QUERY",
+                "Invalid limit! Limit must be a nonnegative integer",
             )
-                .into());
+            .into());
         };
         limit = Some(lim);
     }
@@ -267,11 +270,12 @@ async fn get_messages(
         && !off.is_empty()
     {
         let Ok(off) = off.parse::<usize>() else {
-            return Err((
+            return Err(state_error(
                 StatusCode::BAD_REQUEST,
-                "Invalid offset! Offset must be a nonnegative integer".to_string(),
+                "INVALID_QUERY",
+                "Invalid offset! Offset must be a nonnegative integer",
             )
-                .into());
+            .into());
         };
         offset = Some(off);
     }
@@ -282,17 +286,18 @@ async fn get_messages(
 
 async fn not_found() -> Result<impl IntoResponse, HttpServerError> {
     Err::<Json<Value>, HttpServerError>(
-        (StatusCode::NOT_FOUND, "Route not found".to_string()).into(),
+        state_error(StatusCode::NOT_FOUND, "UNKNOWN_PATH", "Route not found").into(),
     )
 }
 
 async fn method_not_allowed() -> Result<impl IntoResponse, HttpServerError> {
     Err::<Json<Value>, HttpServerError>(
-        (
+        state_error(
             StatusCode::METHOD_NOT_ALLOWED,
-            "method not allowed".to_string(),
+            "METHOD_NOT_ALLOWED",
+            "method not allowed",
         )
-            .into(),
+        .into(),
     )
 }
 fn build_app(state: SharedSystemState) -> Router {
