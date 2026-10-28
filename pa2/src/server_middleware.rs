@@ -471,15 +471,34 @@ pub async fn main_task(
     // connect to all servers < my id (prevents us from launching multiple connections)
     for other_server in &config {
         if other_server.id < id {
-            let socket =
-                TcpStream::connect(format!("{}:{}", other_server.host, other_server.peer_port))
-                    .await
-                    .unwrap();
-            tokio::spawn(peer_task(
-                socket,
-                state.clone(),
-                Some(other_server.id.clone()),
-            ));
+            {
+                // try up to 3 times (6 ish seconds) to connect, otherwise declare server dead
+                // do these before starting the http server that way, once the http server is running,
+                // we have the invariant that the sockets are connected
+                let state = state.clone();
+                let other_server = other_server.clone();
+                let mut socket =
+                    TcpStream::connect(format!("{}:{}", other_server.host, other_server.peer_port))
+                        .await;
+                let mut iters = 0;
+                while socket.is_err() && iters < 3 {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    socket = TcpStream::connect(format!(
+                        "{}:{}",
+                        other_server.host, other_server.peer_port
+                    ))
+                    .await;
+                    iters += 1;
+                }
+                match socket {
+                    Ok(socket) => {
+                        tokio::spawn(peer_task(socket, state.clone(), Some(other_server.id)));
+                    }
+                    Err(_) => {
+                        set_server_state(state, other_server.id, false);
+                    }
+                }
+            }
         }
     }
     // listener
