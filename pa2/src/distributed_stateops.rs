@@ -247,20 +247,20 @@ pub fn init_state(state: SharedSystemState) {
 
 fn user_owner(username: &str) -> LocationConfig {
     // partition users by first letter
-    assert!(username.len() >= 1);
-    let first_char = username.chars().next().unwrap();
-    let first_char_mod = (first_char as u8) % 3;
-    if first_char_mod == 0 {
+    let mut hasher = hash::DefaultHasher::new();
+    hasher.write(username.as_bytes());
+    let h = hasher.finish() % 3;
+    if h == 0 {
         return LocationConfig {
             primary: "A".to_string(),
             backup: "B".to_string(),
         };
-    } else if first_char_mod == 1 {
+    } else if h == 1 {
         return LocationConfig {
             primary: "B".to_string(),
             backup: "C".to_string(),
         };
-    } else if first_char_mod == 2 {
+    } else if h == 2 {
         return LocationConfig {
             primary: "C".to_string(),
             backup: "A".to_string(),

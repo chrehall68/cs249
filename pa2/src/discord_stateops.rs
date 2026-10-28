@@ -74,11 +74,14 @@ pub fn user_exists(state: SharedState, username: &str) -> bool {
 }
 /// Returns the username, if the user was successfully created
 pub fn create_user(state: SharedState, username: String) -> StateResult<()> {
-    if user_exists(state.clone(), &username) {
+    if username.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Empty username".to_string()));
+    }
+    let mut state = state.lock().unwrap();
+    let inserted = state.users.insert(username.clone());
+    if !inserted {
         Err((StatusCode::BAD_REQUEST, "User already exists".to_string()))
     } else {
-        let mut state = state.lock().unwrap();
-        state.users.insert(username.clone());
         Ok(())
     }
 }
