@@ -195,21 +195,26 @@ async fn send_pings_task(state: SharedSystemState, peer_id: String) {
             let peer_id = peer_id.clone();
             tokio::spawn(async move {
                 sleep(Duration::from_secs(2)).await;
-                let mut pending_heartbeats = pending_heartbeats.lock().unwrap();
-                if pending_heartbeats.contains(&cur_key) {
-                    pending_heartbeats.remove(&cur_key);
-                    missed_heartbeats.fetch_add(1, Ordering::SeqCst);
-                    if missed_heartbeats.load(Ordering::SeqCst) == 3 {
-                        println!("Peer {peer_id} missed 3 heartbeats, disconnecting");
-                        set_server_state(state.clone(), peer_id.clone(), false);
-                        state.lock().unwrap().on_failure.notify_waiters();
+                let peer_died = {
+                    let mut pending_heartbeats = pending_heartbeats.lock().unwrap();
+                    if pending_heartbeats.contains(&cur_key) {
+                        pending_heartbeats.remove(&cur_key);
+                        missed_heartbeats.fetch_add(1, Ordering::SeqCst);
+                        missed_heartbeats.load(Ordering::SeqCst) == 3
+                    } else {
+                        false
+                    }
+                };
+                if peer_died {
+                    println!("Peer {peer_id} missed 3 heartbeats, disconnecting");
+                    set_server_state(state.clone(), peer_id.clone(), false);
+                    state.lock().unwrap().on_failure.notify_waiters();
 
-                        // drain the peer state callback queue
-                        let mut state = state.lock().unwrap();
-                        let peer_state = state.server_states.get_mut(&peer_id).unwrap();
-                        for (_, callback) in peer_state.seq_to_callback.drain() {
-                            callback(None);
-                        }
+                    // drain the peer state callback queue
+                    let mut state = state.lock().unwrap();
+                    let peer_state = state.server_states.get_mut(&peer_id).unwrap();
+                    for (_, callback) in peer_state.seq_to_callback.drain() {
+                        callback(None);
                     }
                 }
             });

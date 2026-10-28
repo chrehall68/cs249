@@ -180,8 +180,7 @@ fn receive_callback(state: SharedSystemState) -> ReceiveCallback {
                 } else if request_type == "leave_channel" {
                     let username = request["username"].as_str().unwrap();
                     let channel_name = request["channel"].as_str().unwrap();
-                    // if the original request succeeded, then the user exists somewhere in the system
-                    // so we don't need to check
+                    // similar argument here
                     let user_exists: UserExistsFn =
                         Box::new(move |_username: String| Box::pin(async move { true }));
                     let result = discord_stateops::leave_channel(
@@ -196,16 +195,13 @@ fn receive_callback(state: SharedSystemState) -> ReceiveCallback {
                     let username = request["username"].as_str().unwrap();
                     let channel_name = request["channel"].as_str().unwrap();
                     let text = request["text"].as_str().unwrap();
-                    // if the original request succeeded, then the user exists somewhere in the system
-                    // so we don't need to check
-                    let user_exists: UserExistsFn =
-                        Box::new(move |_username: String| Box::pin(async move { true }));
-                    let result = discord_stateops::send_message(
+                    let message_id = request["message_id"].as_str().unwrap();
+                    let result = discord_stateops::replicate_send_message(
                         get_discord(state),
                         channel_name.to_owned(),
                         username.to_owned(),
                         text.to_owned(),
-                        user_exists,
+                        message_id.to_owned(),
                     )
                     .await;
                     return state_result_to_value(result);
@@ -591,7 +587,7 @@ pub async fn send_message(
         if config.backup == id || !get_server_state(state.clone(), &config.backup) {
             return Ok(message_id);
         }
-        let message = json!({"username": username, "channel": channel_name, "text": text});
+        let message = json!({"username": username, "channel": channel_name, "text": text, "message_id": message_id});
         let forward_result = replicate_op(
             state.clone(),
             message,
