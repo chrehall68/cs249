@@ -2,20 +2,18 @@
 
 Name: Eliot Hall
 
-TODO - add video / timestamps
-
 Video timestamps :
 
 | Step                              | Time |
 | --------------------------------- | ---- |
-| Start all three servers           | TODO |
-| Verify health                     | TODO |
-| Initial process and leader status | TODO |
-| User sharing                      | TODO |
-| Request forwarding                | TODO |
-| Message replication               | TODO |
-| Failure detection                 | TODO |
-| Leader selection                  | TODO |
+| Start all three servers           | 0:06 |
+| Verify health                     | 0:20 |
+| Initial process and leader status | 0:42 |
+| User sharing                      | 1:09 |
+| Request forwarding                | 2:12 |
+| Message replication               | 3:04 |
+| Failure detection                 | 5:15 |
+| Leader selection                  | 6:28 |
 
 1. Architecture and process configuration
 
